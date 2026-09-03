@@ -1,0 +1,22 @@
+[Unit]
+Description=GLDC Python Production Web Application
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gldc
+Group=gldc
+WorkingDirectory=/opt/gldc
+EnvironmentFile=/opt/gldc/.env
+ExecStart=/opt/gldc/.venv/bin/gunicorn --config /opt/gldc/gunicorn.conf.py wsgi:application
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/gldc
+
+[Install]
+WantedBy=multi-user.target
