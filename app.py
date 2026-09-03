@@ -16,26 +16,50 @@ from pymongo import MongoClient, ASCENDING, DESCENDING, ReturnDocument
 
 load_dotenv()
 
+def env(name, *aliases, default=None):
+    """Read the canonical Python setting, then compatible hosted aliases."""
+    for key in (name, *aliases):
+        value = os.getenv(key)
+        if value is not None and str(value).strip() != '':
+            return value
+    return default
+
+def env_bool(name, *aliases, default=False):
+    return str(env(name, *aliases, default=str(default))).strip().lower() in {'1','true','yes','on'}
+
 app = Flask(__name__)
-APP_ENV = os.getenv('APP_ENV', 'production').lower()
-AUTH_SECRET = os.getenv('AUTH_SECRET', '')
+APP_ENV = str(env('APP_ENV', 'NODE_ENV', default='production')).lower()
+APP_URL = str(env('APP_URL', default='http://localhost:5000')).rstrip('/')
+ADMIN_PATH = str(env('ADMIN_PATH', default='/admin')).strip() or '/admin'
+if not ADMIN_PATH.startswith('/'):
+    ADMIN_PATH = '/' + ADMIN_PATH
+ADMIN_PATH = ADMIN_PATH.rstrip('/') or '/admin'
+AUTH_SECRET = str(env('AUTH_SECRET', 'JWT_ACCESS_SECRET', default=''))
 # Never crash a serverless function during module import because environment variables are missing.
 # Production readiness is reported by /api/ready, while configured deployments use the real secret.
 app.secret_key = AUTH_SECRET or secrets.token_hex(32)
 app.config['SESSION_COOKIE_HTTPONLY'] = True
-app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['SESSION_COOKIE_SAMESITE'] = str(env('COOKIE_SAME_SITE', default='Lax')).capitalize()
 app.config['SESSION_COOKIE_SECURE'] = os.getenv('COOKIE_SECURE', 'true' if APP_ENV == 'production' else 'false').lower() == 'true'
 app.config['SESSION_COOKIE_NAME'] = os.getenv('SESSION_COOKIE_NAME', 'gldc_session')
 app.config['SESSION_COOKIE_PATH'] = '/'
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=int(os.getenv('SESSION_LIFETIME_HOURS','8')))
-app.config['MAX_CONTENT_LENGTH'] = int(os.getenv('MAX_CONTENT_LENGTH_MB','2')) * 1024 * 1024
+app.config['MAX_CONTENT_LENGTH'] = int(env('MAX_CONTENT_LENGTH_MB', default=env('MAX_FILE_SIZE_MB', default='25'))) * 1024 * 1024
 
-APP_TIMEZONE = os.getenv('APP_TIMEZONE', 'Africa/Nairobi')
-CURRENCY = os.getenv('CURRENCY', 'KES')
+APP_TIMEZONE = str(env('APP_TIMEZONE', 'TIMEZONE', default='Africa/Nairobi'))
+CURRENCY = str(env('CURRENCY', default='KES'))
+PAYMENTS_ENABLED = env_bool('PAYMENTS_ENABLED', default=True)
+MEMBERSHIP_ENABLED = env_bool('MEMBERSHIP_ENABLED', default=True)
+EMAIL_NOTIFICATIONS_ENABLED = env_bool('EMAIL_NOTIFICATIONS_ENABLED', default=True)
+ADMIN_NOTIFICATIONS_ENABLED = env_bool('ADMIN_NOTIFICATIONS_ENABLED', default=True)
+DOCUMENT_STORAGE = str(env('DOCUMENT_STORAGE', default='google_drive'))
+PDF_ENABLED = env_bool('PDF_ENABLED', default=True)
+PDF_QR_ENABLED = env_bool('PDF_QR_ENABLED', default=False)
+SIGNATURE_ENABLED = env_bool('SIGNATURE_ENABLED', default=False)
 MONGO_URI = os.getenv('MONGODB_URI', '')
 MONGO_DB = os.getenv('MONGODB_DB_NAME', 'gldc')
 
-mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000, maxPoolSize=20) if MONGO_URI else None
+mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000, maxPoolSize=20, tz_aware=True) if MONGO_URI else None
 db = mongo_client[MONGO_DB] if mongo_client is not None else None
 
 
@@ -90,24 +114,35 @@ def admin_required(f):
 
 def bootstrap_admin():
     if db is None: return
-    email=os.getenv('INITIAL_ADMIN_EMAIL','').strip().lower(); password=os.getenv('INITIAL_ADMIN_PASSWORD','')
+    email=str(env('INITIAL_ADMIN_EMAIL','ADMIN_EMAIL', default='')).strip().lower(); password=str(env('INITIAL_ADMIN_PASSWORD','ADMIN_INITIAL_PASSWORD', default=''))
     if not email or not password: return
     if len(password) < 12: raise RuntimeError('INITIAL_ADMIN_PASSWORD must be at least 12 characters.')
     if db.users.count_documents({'role':'SUPER ADMIN / OWNER'}) == 0:
-        db.users.update_one({'email':email},{'$setOnInsert':{'email':email,'name':'GLDC Administrator','passwordHash':hash_password(password),'role':'SUPER ADMIN / OWNER','status':'ACTIVE','createdAt':now(),'updatedAt':now()}},upsert=True)
+        db.users.update_one({'email':email},{'$setOnInsert':{'email':email,'name':str(env('ADMIN_NAME', default='GLDC Administrator')),'passwordHash':hash_password(password),'role':'SUPER ADMIN / OWNER','status':'ACTIVE','createdAt':now(),'updatedAt':now()}},upsert=True)
 
 
 def send_email(to, subject, text, html=None, attachments=None):
-    host=os.getenv('SMTP_HOST'); user=os.getenv('SMTP_USER'); password=os.getenv('SMTP_PASSWORD')
+    host=env('SMTP_HOST'); user=env('SMTP_USER','GMAIL_USER'); password=env('SMTP_PASSWORD','GMAIL_APP_PASSWORD')
     if not host: raise RuntimeError('SMTP_NOT_CONFIGURED')
-    msg=EmailMessage(); msg['From']=os.getenv('SMTP_FROM', user); msg['To']=to; msg['Subject']=subject
-    if os.getenv('SMTP_REPLY_TO'): msg['Reply-To']=os.getenv('SMTP_REPLY_TO')
+    msg=EmailMessage();
+    from_name=str(env('EMAIL_FROM_NAME', default='GLDC')); from_address=str(env('EMAIL_FROM_ADDRESS', default='')).strip()
+    smtp_from=str(env('SMTP_FROM', default='')).strip()
+    if not from_address and smtp_from:
+        m=re.match(r'^\s*(.*?)\s*<([^<>]+)>\s*$', smtp_from)
+        if m:
+            from_name=(m.group(1).strip() or from_name); from_address=m.group(2).strip()
+        else:
+            from_address=smtp_from
+    if not from_address: from_address=user or ''
+    msg['From']=f'{from_name} <{from_address}>' if from_address else user; msg['To']=to; msg['Subject']=subject
+    reply_to=env('EMAIL_REPLY_TO','SMTP_REPLY_TO');
+    if reply_to: msg['Reply-To']=reply_to
     msg.set_content(text)
     if html: msg.add_alternative(html, subtype='html')
     for filename, data, mimetype in attachments or []:
         maintype, subtype = mimetype.split('/', 1)
         msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=filename)
-    port=int(os.getenv('SMTP_PORT','587')); secure=os.getenv('SMTP_SECURE','false').lower()=='true'
+    port=int(env('SMTP_PORT', default='587')); secure=env_bool('SMTP_SECURE', default=False)
     if secure:
         with smtplib.SMTP_SSL(host,port) as s: s.login(user,password); s.send_message(msg)
     else:
@@ -118,7 +153,7 @@ def send_email(to, subject, text, html=None, attachments=None):
 def build_invoice_pdf(invoice):
     buf=BytesIO(); c=canvas.Canvas(buf, pagesize=A4); w,h=A4
     company=os.getenv('COMPANY_NAME','Gavin Land & Design Consultants')
-    contact=' • '.join(x for x in [os.getenv('SMTP_FROM',''), os.getenv('COMPANY_PHONE','')] if x)
+    contact=' • '.join(x for x in [os.getenv('SMTP_FROM',''), env('COMPANY_PHONE','PHONE', default='')] if x)
     c.setTitle(invoice['invoiceNumber'])
     c.setFont('Helvetica-Bold',20); c.drawString(25*mm,h-30*mm,company)
     c.setFont('Helvetica',9); c.drawString(25*mm,h-37*mm,'Land • Design • Development • Project Consultancy')
@@ -145,7 +180,9 @@ def build_invoice_pdf(invoice):
 def request_otp(email):
     if db is None: raise RuntimeError('DATABASE_UNAVAILABLE')
     email=email.lower().strip(); cool=int(os.getenv('OTP_RESEND_COOLDOWN_SECONDS','60')); expiry=int(os.getenv('OTP_EXPIRY_MINUTES','10'))
-    if db.otps.find_one({'email':email,'createdAt':{'$gt':now()-timedelta(seconds=cool)}}): raise RuntimeError('OTP_COOLDOWN')
+    # Use a UTC datetime that MongoDB can compare consistently.
+    cooldown_since = now() - timedelta(seconds=cool)
+    if db.otps.find_one({'email':email,'createdAt':{'$gt':cooldown_since}}): raise RuntimeError('OTP_COOLDOWN')
     code=f'{secrets.randbelow(900000)+100000}'
     db.otps.insert_one({'email':email,'codeHash':hashlib.sha256(code.encode()).hexdigest(),'createdAt':now(),'expiresAt':now()+timedelta(minutes=expiry),'attempts':0})
     send_email(email,'GLDC verification code',f'Your GLDC verification code is {code}. It expires in {expiry} minutes.',f'<p>Your GLDC verification code is <strong>{code}</strong>.</p><p>It expires in {expiry} minutes.</p>')
@@ -173,7 +210,18 @@ def verify_otp(email, code):
 
     # Be defensive with records created by older versions of the application.
     expires_at = x.get('expiresAt')
-    if not isinstance(expires_at, datetime) or expires_at < now():
+    if not isinstance(expires_at, datetime):
+        raise RuntimeError('OTP_EXPIRED')
+    # PyMongo returns BSON UTC datetimes as naive datetimes unless tz_aware=True.
+    # Normalize both sides to UTC-aware before comparing, otherwise Python raises
+    # TypeError: can't compare offset-naive and offset-aware datetimes, which was
+    # causing the verification endpoint to return HTTP 500 even though OTP sending
+    # and MongoDB itself were working.
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    else:
+        expires_at = expires_at.astimezone(timezone.utc)
+    if expires_at < now():
         raise RuntimeError('OTP_EXPIRED')
 
     attempts = x.get('attempts', 0)
@@ -415,9 +463,12 @@ def daraja_token():
     r=requests.get(base+'/oauth/v1/generate?grant_type=client_credentials',headers={'Authorization':'Basic '+auth},timeout=20); r.raise_for_status(); return base,r.json()['access_token']
 
 def daraja_stk(phone,amount,reference,description):
-    base,access=daraja_token(); ts=datetime.now().strftime('%Y%m%d%H%M%S'); short=os.getenv('DARAJA_SHORTCODE'); passkey=os.getenv('DARAJA_PASSKEY')
+    base,access=daraja_token(); ts=datetime.now().strftime('%Y%m%d%H%M%S'); short=str(env('DARAJA_SHORTCODE','DARAJA_PARTY_A_SHORTCODE', default='')); passkey=str(env('DARAJA_PASSKEY', default=''))
     password=base64.b64encode(f'{short}{passkey}{ts}'.encode()).decode()
-    body={'BusinessShortCode':short,'Password':password,'Timestamp':ts,'TransactionType':os.getenv('DARAJA_TRANSACTION_TYPE','CustomerBuyGoodsOnline'),'Amount':round(amount),'PartyA':phone,'PartyB':os.getenv('DARAJA_TILL_NUMBER'),'PhoneNumber':phone,'CallBackURL':os.getenv('DARAJA_CALLBACK_URL'),'AccountReference':reference,'TransactionDesc':description}
+    callback = str(env('DARAJA_CALLBACK_URL', default=APP_URL + '/api/payments/callback')).rstrip('/')
+    if not callback.endswith('/api/payments/callback'):
+        callback += '/api/payments/callback'
+    body={'BusinessShortCode':str(env('DARAJA_SHORTCODE','DARAJA_PARTY_A_SHORTCODE', default='')),'Password':password,'Timestamp':ts,'TransactionType':str(env('DARAJA_TRANSACTION_TYPE','MPESA_TRANSACTION_TYPE', default='CustomerBuyGoodsOnline')),'Amount':round(amount),'PartyA':str(env('DARAJA_PARTY_A_SHORTCODE','DARAJA_SHORTCODE', default='')),'PartyB':str(env('DARAJA_TILL_NUMBER','DARAJA_PARTY_B_BUYGOODS_TILL', default='')),'PhoneNumber':phone,'CallBackURL':callback,'AccountReference':reference,'TransactionDesc':description}
     r=requests.post(base+'/mpesa/stkpush/v1/processrequest',headers={'Authorization':'Bearer '+access,'Content-Type':'application/json'},json=body,timeout=30); data=r.json()
     if not r.ok or data.get('ResponseCode')!='0': raise RuntimeError('DARAJA_STK_FAILED:'+str(data.get('ResponseDescription') or data.get('errorMessage') or 'Unknown error'))
     return data
@@ -430,17 +481,45 @@ def client_ip():
     return request.remote_addr or 'unknown'
 
 def validate_production_config():
-    if APP_ENV != 'production': return []
-    required = ['MONGODB_URI','MONGODB_DB_NAME','AUTH_SECRET','SMTP_HOST','SMTP_USER','SMTP_PASSWORD','SMTP_FROM']
-    missing = [k for k in required if not os.getenv(k)]
-    if os.getenv('INITIAL_ADMIN_EMAIL') and not os.getenv('INITIAL_ADMIN_PASSWORD'):
-        missing.append('INITIAL_ADMIN_PASSWORD')
-    if os.getenv('DARAJA_ENABLED','true').lower() == 'true':
-        missing += [k for k in ['DARAJA_CONSUMER_KEY','DARAJA_CONSUMER_SECRET','DARAJA_SHORTCODE','DARAJA_TILL_NUMBER','DARAJA_PASSKEY','DARAJA_CALLBACK_URL'] if not os.getenv(k)]
-    if os.getenv('GOOGLE_DRIVE_ENABLED','true').lower() == 'true':
-        if not os.getenv('GOOGLE_DRIVE_FOLDER_ID'): missing.append('GOOGLE_DRIVE_FOLDER_ID')
-        if not os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON') and not (os.getenv('GOOGLE_SERVICE_ACCOUNT_EMAIL') and os.getenv('GOOGLE_PRIVATE_KEY')):
+    if APP_ENV != 'production':
+        return []
+    required_groups = [
+        ('MONGODB_URI',),
+        ('MONGODB_DB_NAME',),
+        ('AUTH_SECRET', 'JWT_ACCESS_SECRET'),
+        ('SMTP_HOST',),
+        ('SMTP_USER', 'GMAIL_USER'),
+        ('SMTP_PASSWORD', 'GMAIL_APP_PASSWORD'),
+        ('SMTP_FROM', 'EMAIL_FROM_ADDRESS'),
+    ]
+    missing = []
+    for group in required_groups:
+        if not any(env(k) for k in group):
+            missing.append('/'.join(group))
+    admin_email = env('INITIAL_ADMIN_EMAIL', 'ADMIN_EMAIL')
+    admin_password = env('INITIAL_ADMIN_PASSWORD', 'ADMIN_INITIAL_PASSWORD')
+    if admin_email and not admin_password:
+        missing.append('INITIAL_ADMIN_PASSWORD/ADMIN_INITIAL_PASSWORD')
+
+    if env_bool('DARAJA_ENABLED', default=True):
+        daraja_groups = [
+            ('DARAJA_CONSUMER_KEY',), ('DARAJA_CONSUMER_SECRET',),
+            ('DARAJA_SHORTCODE', 'DARAJA_PARTY_A_SHORTCODE'),
+            ('DARAJA_TILL_NUMBER', 'DARAJA_PARTY_B_BUYGOODS_TILL', 'DARAJA_BUYGOODS_TILL'),
+            ('DARAJA_PASSKEY',),
+            ('DARAJA_CALLBACK_URL',),
+        ]
+        for group in daraja_groups:
+            if not any(env(k) for k in group):
+                missing.append('/'.join(group))
+
+    if env_bool('GOOGLE_DRIVE_ENABLED', default=True):
+        if not env('GOOGLE_DRIVE_FOLDER_ID'):
+            missing.append('GOOGLE_DRIVE_FOLDER_ID')
+        if not env('GOOGLE_SERVICE_ACCOUNT_JSON') and not (env('GOOGLE_SERVICE_ACCOUNT_EMAIL') and env('GOOGLE_PRIVATE_KEY')):
             missing.append('GOOGLE_SERVICE_ACCOUNT_EMAIL/GOOGLE_PRIVATE_KEY or GOOGLE_SERVICE_ACCOUNT_JSON')
+    if env_bool('GOOGLE_SHEETS_ENABLED', default=False) and not env('GOOGLE_SPREADSHEET_ID'):
+        missing.append('GOOGLE_SPREADSHEET_ID')
     return list(dict.fromkeys(missing))
 
 CONFIG_MISSING = [] if APP_ENV != 'production' else validate_production_config()
@@ -483,7 +562,7 @@ def inject_security():
     return {'csrf_token': csrf_token}
 
 @app.context_processor
-def globals_(): return {'current_user':current_user(),'currency':CURRENCY,'year':datetime.now().year}
+def globals_(): return {'current_user':current_user(),'currency':CURRENCY,'year':datetime.now().year,'admin_path':ADMIN_PATH,'app_url':APP_URL}
 
 @app.get('/api/health')
 def api_health():
@@ -493,7 +572,8 @@ def api_health():
     started = time.perf_counter()
     if db is None:
         return jsonify(ok=False, service='gldc', environment=APP_ENV, status='DEGRADED',
-                       database='NOT_CONFIGURED', latencyMs=round((time.perf_counter()-started)*1000, 2),
+                       database='NOT_CONFIGURED', configurationMissing=CONFIG_MISSING,
+                       latencyMs=round((time.perf_counter()-started)*1000, 2),
                        requestId=request.request_id), 503
     try:
         db.client.admin.command('ping')
@@ -513,7 +593,7 @@ def api_ready():
         return jsonify(ok=False, ready=False, error={'code':'CONFIGURATION_INCOMPLETE','message':'Required production configuration is missing.','missing':missing}), 503
     if not database_ok:
         return jsonify(ok=False, ready=False, error={'code':'DATABASE_UNAVAILABLE','message':'Database is unavailable.','detail':_database_init_error}), 503
-    return jsonify(ok=True, ready=True, database=True), 200
+    return jsonify(ok=True, ready=True, database=True, integrations={'smtp': bool(env('SMTP_HOST')), 'googleDrive': env_bool('GOOGLE_DRIVE_ENABLED', default=True), 'googleSheets': env_bool('GOOGLE_SHEETS_ENABLED', default=False), 'daraja': env_bool('DARAJA_ENABLED', default=True)}, requestId=request.request_id), 200
 
 @app.route('/')
 def home(): return render_template('home.html', title='Land. Design. Development. Done Right.')
@@ -550,6 +630,7 @@ def privacy(): return render_template('privacy.html', title='Privacy Policy')
 def terms(): return render_template('terms.html', title='Terms & Conditions')
 
 @app.route('/admin')
+@app.route(ADMIN_PATH)
 def admin(): return render_template('admin.html', title='Management Console')
 
 @app.post('/api/auth/login')
@@ -607,7 +688,7 @@ def api_verify_otp():
         app.logger.exception('OTP verification runtime failure request=%s email=%s', request_id, email)
         return jsonify(ok=False, error={'code':'OTP_VERIFY_FAILED','message':'Unable to verify the code right now.','requestId':request_id}), 500
     except Exception as exc:
-        app.logger.exception('OTP verification unexpected failure request=%s email=%s', request_id, email if 'email' in locals() else '')
+        app.logger.exception('OTP verification unexpected failure request=%s email=%s error=%r', request_id, email if 'email' in locals() else '', exc)
         return jsonify(ok=False, error={'code':'OTP_VERIFY_FAILED','message':'Unable to verify the code right now.','requestId':request_id}), 500
 
 @app.post('/api/leads')
@@ -625,6 +706,7 @@ def api_leads():
 
 @app.post('/api/members/register')
 def api_member_register():
+    if not MEMBERSHIP_ENABLED: return json_error('Membership is currently disabled.', 503, 'MEMBERSHIP_DISABLED')
     b=request.get_json(force=True) or {}; name=str(b.get('name','')).strip(); email=str(b.get('email','')).strip().lower(); phone=str(b.get('phone','')).strip()
     if len(name)<2 or '@' not in email or len(phone)<7: return json_error('Invalid member information.',422,'VALIDATION_ERROR')
     try:
@@ -762,7 +844,7 @@ def api_stats():
 @admin_required
 def api_settings():
     s=db.settings.find_one({'key':'public'}) or {}
-    return jsonify(ok=True,settings={'currency':CURRENCY,'timezone':APP_TIMEZONE,'darajaEnvironment':os.getenv('DARAJA_ENV','production'),'smtpConfigured':bool(os.getenv('SMTP_HOST')),'googleDriveConfigured':os.getenv('GOOGLE_DRIVE_ENABLED','true').lower()=='true' and bool(os.getenv('GOOGLE_DRIVE_FOLDER_ID')),'googleDriveAuth':'service-account','googleSheetsConfigured':os.getenv('GOOGLE_SHEETS_ENABLED','false').lower()=='true' and bool(os.getenv('GOOGLE_SPREADSHEET_ID')),'mongodbConfigured':bool(MONGO_URI),'public':{k:s.get(k,'') for k in ['company','phone','email','location','hours','tagline']}})
+    return jsonify(ok=True,settings={'currency':CURRENCY,'timezone':APP_TIMEZONE,'appUrl':APP_URL,'adminPath':ADMIN_PATH,'darajaEnvironment':str(env('DARAJA_ENV','DARAJA_ENVIRONMENT', default='production')),'smtpConfigured':bool(env('SMTP_HOST') and env('SMTP_USER','GMAIL_USER') and env('SMTP_PASSWORD','GMAIL_APP_PASSWORD') and env('SMTP_FROM','EMAIL_FROM_ADDRESS')),'googleDriveConfigured':env_bool('GOOGLE_DRIVE_ENABLED', default=True) and bool(env('GOOGLE_DRIVE_FOLDER_ID')),'googleDriveAuth':'service-account','googleSheetsConfigured':env_bool('GOOGLE_SHEETS_ENABLED', default=False) and bool(env('GOOGLE_SPREADSHEET_ID')),'mongodbConfigured':bool(MONGO_URI),'paymentsEnabled':PAYMENTS_ENABLED,'membershipEnabled':MEMBERSHIP_ENABLED,'documentStorage':DOCUMENT_STORAGE,'pdfEnabled':PDF_ENABLED,'public':{k:s.get(k,'') for k in ['company','phone','email','location','hours','tagline']}})
 
 @app.post('/api/admin/settings')
 @admin_required
@@ -844,6 +926,7 @@ def api_admin_invoice_resend(invoice_number):
 @app.post('/api/payments/stk')
 @login_required
 def api_stk():
+    if not PAYMENTS_ENABLED: return json_error('Payments are currently disabled.', 503, 'PAYMENTS_DISABLED')
     b=request.get_json(force=True) or {}; phone=str(b.get('phone','')).strip(); amount=int(float(b.get('amount',0))); reference=str(b.get('reference','')).strip(); desc=str(b.get('description','')).strip(); lead_id=b.get('leadId')
     if len(phone)<7 or amount<=0 or amount>100000000 or len(reference)<2 or len(desc)<2: return json_error('Invalid payment request.',422,'VALIDATION_ERROR')
     u=current_user()

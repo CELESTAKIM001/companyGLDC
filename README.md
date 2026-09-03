@@ -101,3 +101,7 @@ For the M-Pesa callback, use the deployed HTTPS URL ending in `/api/payments/cal
 ## Vercel / PyMongo import-safety fix
 
 The Vercel serverless entry point is `api/index.py`. MongoDB initialization is lazy and is never performed during module import. PyMongo `Database` objects are always checked with `is None` / `is not None`; they are never evaluated as booleans. This prevents `NotImplementedError: Database objects do not implement truth value testing` during Vercel cold starts.
+
+## Hosted Vercel environment compatibility
+
+Use `.env.hosted.example` as the Python-compatible template for the existing hosted configuration. `VERCEL_HOSTED_ENV_MAPPING.md` documents aliases from the previous Node environment naming scheme. Do not commit production secrets.
