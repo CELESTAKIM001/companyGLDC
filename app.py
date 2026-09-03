@@ -176,13 +176,36 @@ def google_service(service, scopes):
     return build(service, 'v3', credentials=creds, cache_discovery=False)
 
 
-def drive_files():
+def drive_files(minimum=40, max_files=200):
+    """List real files from the configured Drive folder with pagination.
+
+    The admin console should have at least 40 real records available for a
+    useful integration test when the folder contains that many. We never
+    fabricate files: if the folder contains fewer, the actual count is returned.
+    Additional Drive pages are fetched up to max_files.
+    """
     if os.getenv('GOOGLE_DRIVE_ENABLED','true').lower()!='true': return []
     d=google_service('drive',['https://www.googleapis.com/auth/drive.readonly'])
     folder=os.getenv('GOOGLE_DRIVE_FOLDER_ID','')
     if not folder: raise RuntimeError('GOOGLE_DRIVE_FOLDER_NOT_CONFIGURED')
-    r=d.files().list(q=f"'{folder}' in parents and trashed=false",fields='files(id,name,mimeType,size,modifiedTime,webViewLink,webContentLink)',orderBy='modifiedTime desc',pageSize=100,supportsAllDrives=True,includeItemsFromAllDrives=True).execute()
-    return r.get('files',[])
+    target=max(1, int(minimum or 40))
+    limit=max(target, int(max_files or 200))
+    fields='nextPageToken,files(id,name,mimeType,size,modifiedTime,webViewLink,webContentLink,shortcutDetails)'
+    files=[]
+    token=None
+    while len(files) < limit:
+        kwargs=dict(q=f"'{folder}' in parents and trashed=false", fields=fields,
+                    orderBy='modifiedTime desc', pageSize=min(100, limit-len(files)),
+                    supportsAllDrives=True, includeItemsFromAllDrives=True)
+        if token:
+            kwargs['pageToken']=token
+        r=d.files().list(**kwargs).execute()
+        batch=r.get('files',[]) or []
+        files.extend(batch)
+        token=r.get('nextPageToken')
+        if not token or not batch:
+            break
+    return files[:limit]
 
 
 def _drive_download_bytes(http_request, label='Drive download'):
