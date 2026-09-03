@@ -1,1 +1,54 @@
-{% extends 'generic.html' %}{% set eyebrow='VERIFICATION' %}{% set heading='Email verification' %}{% set intro='Enter the verification code sent to your email.' %}{% block body %}<section class="section"><div class="container grid grid-2"><form class="form-card" id="verifyForm"><div class="field"><label>Email</label><input type="email" id="email" required></div><div class="field"><label>Verification code</label><input id="code" inputmode="numeric" maxlength="6" required></div><div class="actions"><button class="btn secondary" type="button" onclick="sendCode()">RESEND CODE</button><button class="btn primary">VERIFY EMAIL</button></div><div id="verifyMsg"></div></form><div class="card"><h2>Secure verification</h2><p>Codes expire after the configured interval and repeated invalid attempts are limited.</p></div></div></section>{% endblock %}{% block scripts %}<script>const qs=new URLSearchParams(location.search);document.getElementById('email').value=qs.get('email')||'';async function sendCode(){const email=document.getElementById('email').value;const r=await fetch('/api/auth/request-otp',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email})});const j=await r.json();document.getElementById('verifyMsg').innerHTML=`<div class="notice">${j.message||j.error?.message||'Done.'}</div>`}document.getElementById('verifyForm').addEventListener('submit',async e=>{e.preventDefault();const email=document.getElementById('email').value,code=document.getElementById('code').value;const r=await fetch('/api/auth/verify-otp',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,code})});const j=await r.json();document.getElementById('verifyMsg').innerHTML=`<div class="notice">${j.verified?'Email verified successfully.':j.error?.message||'Unable to verify.'}</div>`})</script>{% endblock %}
+{% extends 'generic.html' %}{% set eyebrow='VERIFICATION' %}{% set heading='Email verification' %}{% set intro='Enter the verification code sent to your email.' %}{% block body %}<section class="section"><div class="container grid grid-2"><form class="form-card" id="verifyForm"><div class="field"><label>Email</label><input type="email" id="email" required></div><div class="field"><label>Verification code</label><input id="code" inputmode="numeric" maxlength="6" required></div><div class="actions"><button class="btn secondary" type="button" onclick="sendCode()">RESEND CODE</button><button class="btn primary">VERIFY EMAIL</button></div><div id="verifyMsg"></div></form><div class="card"><h2>Secure verification</h2><p>Codes expire after the configured interval and repeated invalid attempts are limited.</p></div></div></section>{% endblock %}{% block scripts %}<script>
+const qs=new URLSearchParams(location.search);
+const emailInput=document.getElementById('email');
+const codeInput=document.getElementById('code');
+const verifyForm=document.getElementById('verifyForm');
+const verifyMsg=document.getElementById('verifyMsg');
+emailInput.value=qs.get('email')||'';
+
+async function readApiResponse(response){
+  const text=await response.text();
+  let data={};
+  try{data=text?JSON.parse(text):{};}catch(_){data={ok:false,error:{code:'NON_JSON_RESPONSE',message:text||'The server returned an empty response.'}};}
+  if(!response.ok){
+    const message=data?.error?.message || data?.message || `Server error (${response.status}).`;
+    const err=new Error(message); err.status=response.status; err.code=data?.error?.code; err.requestId=data?.requestId || response.headers.get('X-Request-ID'); throw err;
+  }
+  return data;
+}
+
+function showMessage(message, ok=false){
+  verifyMsg.innerHTML=`<div class="notice ${ok?'success':''}">${message}</div>`;
+}
+
+async function sendCode(){
+  const email=emailInput.value.trim();
+  if(!email){showMessage('Enter your email address first.'); emailInput.focus(); return;}
+  try{
+    const r=await fetch('/api/auth/request-otp',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email})});
+    const j=await readApiResponse(r);
+    showMessage(j.message||'Verification code sent.',true);
+  }catch(err){
+    showMessage(err.message + (err.requestId?` <small>Reference: ${err.requestId}</small>`:''));
+    console.error('OTP resend failed',err);
+  }
+}
+
+verifyForm.addEventListener('submit',async e=>{
+  e.preventDefault();
+  const email=emailInput.value.trim(), code=codeInput.value.trim();
+  const button=verifyForm.querySelector('button[type="submit"]') || verifyForm.querySelector('.btn.primary');
+  button.disabled=true;
+  showMessage('Verifying…');
+  try{
+    const r=await fetch('/api/auth/verify-otp',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,code})});
+    const j=await readApiResponse(r);
+    showMessage('Email verified successfully. You can continue.',true);
+    codeInput.value='';
+    button.disabled=true;
+  }catch(err){
+    showMessage(err.message + (err.requestId?` <small>Reference: ${err.requestId}</small>`:''));
+    console.error('OTP verification failed',err);
+  }finally{button.disabled=false;}
+});
+</script>{% endblock %}

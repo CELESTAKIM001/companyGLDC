@@ -1,4 +1,4 @@
-import os, re, json, base64, hashlib, secrets, smtplib
+import os, re, json, base64, hashlib, secrets, smtplib, time, traceback
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from email.message import EmailMessage
@@ -7,7 +7,7 @@ import requests
 import bcrypt
 import jwt
 from dotenv import load_dotenv
-from flask import Flask, render_template, request, jsonify, redirect, url_for, session, flash, send_file, abort, Response
+from flask import Flask, render_template, request, jsonify, redirect, url_for, session, flash, send_file, abort
 from pymongo import MongoClient, ASCENDING, DESCENDING, ReturnDocument
 
 load_dotenv()
@@ -118,13 +118,72 @@ def request_otp(email):
 
 
 def verify_otp(email, code):
-    email=email.lower().strip(); x=db.otps.find_one({'email':email}, sort=[('createdAt',DESCENDING)])
-    max_attempts=int(os.getenv('OTP_MAX_ATTEMPTS','5'))
-    if not x or x['expiresAt'] < now(): raise RuntimeError('OTP_EXPIRED')
-    if x.get('attempts',0)>=max_attempts: raise RuntimeError('OTP_LOCKED')
-    if x['codeHash'] != hashlib.sha256(code.strip().encode()).hexdigest():
-        db.otps.update_one({'_id':x['_id']},{'$inc':{'attempts':1}}); raise RuntimeError('OTP_INVALID')
-    db.otps.delete_many({'email':email}); return True
+    """Verify the newest OTP defensively, including legacy/malformed records.
+
+    OTP verification must never allow a malformed MongoDB document to bubble up
+    as a serverless 500. Older deployments may contain string/dict dates or a
+    missing codeHash, so normalize and validate every field before comparing.
+    """
+    if db is None:
+        raise RuntimeError('DATABASE_UNAVAILABLE')
+    email = str(email or '').strip().lower()
+    code = str(code or '').strip()
+    if not email or '@' not in email:
+        raise RuntimeError('VALIDATION_ERROR')
+    if not code.isdigit() or len(code) != 6:
+        raise RuntimeError('OTP_INVALID')
+
+    try:
+        x = db.otps.find_one({'email': email}, sort=[('createdAt', DESCENDING)])
+    except Exception as exc:
+        app.logger.exception('OTP MongoDB read failed email=%s', email)
+        raise RuntimeError('DATABASE_UNAVAILABLE') from exc
+
+    if not x:
+        raise RuntimeError('OTP_EXPIRED')
+
+    max_attempts = int(os.getenv('OTP_MAX_ATTEMPTS', '5'))
+    attempts = x.get('attempts', 0)
+    try:
+        attempts = int(attempts or 0)
+    except (TypeError, ValueError):
+        attempts = 0
+    if attempts >= max_attempts:
+        raise RuntimeError('OTP_LOCKED')
+
+    expires = x.get('expiresAt')
+    if isinstance(expires, dict):
+        # A legacy/incorrect document should be treated as expired, not as a
+        # Python type error that can crash a Vercel invocation.
+        app.logger.warning('Malformed OTP expiry document id=%s', x.get('_id'))
+        raise RuntimeError('OTP_EXPIRED')
+    if isinstance(expires, str):
+        try:
+            expires = datetime.fromisoformat(expires.replace('Z', '+00:00'))
+        except ValueError:
+            raise RuntimeError('OTP_EXPIRED')
+    if not isinstance(expires, datetime):
+        raise RuntimeError('OTP_EXPIRED')
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    if expires < now():
+        raise RuntimeError('OTP_EXPIRED')
+
+    stored_hash = x.get('codeHash')
+    expected_hash = hashlib.sha256(code.encode('utf-8')).hexdigest()
+    if not isinstance(stored_hash, str) or not secrets.compare_digest(stored_hash, expected_hash):
+        try:
+            db.otps.update_one({'_id': x['_id']}, {'$inc': {'attempts': 1}})
+        except Exception:
+            app.logger.exception('OTP attempt counter update failed id=%s', x.get('_id'))
+        raise RuntimeError('OTP_INVALID')
+
+    try:
+        db.otps.delete_many({'email': email})
+    except Exception as exc:
+        app.logger.exception('OTP cleanup failed email=%s', email)
+        raise RuntimeError('DATABASE_UNAVAILABLE') from exc
+    return True
 
 
 def google_creds():
@@ -207,58 +266,6 @@ def _drive_download_bytes(http_request, label='Drive download'):
     return bytes(data)
 
 
-def _drive_download_direct(file_id, meta=None, label='Drive media download'):
-    """Download a Drive binary file using an authenticated HTTPS request.
-
-    This deliberately bypasses the googleapiclient media request wrapper. Some
-    serverless/proxy combinations have returned the Drive *metadata JSON* even
-    though the request was created with alt=media. An AuthorizedSession makes
-    the actual media URL explicit and lets us validate the response before it
-    reaches Flask's PDF response.
-    """
-    import requests as _requests
-    from google.auth.transport.requests import AuthorizedSession
-    from google.oauth2 import service_account
-
-    creds = service_account.Credentials.from_service_account_info(
-        google_creds(), scopes=['https://www.googleapis.com/auth/drive.readonly']
-    )
-    session = AuthorizedSession(creds)
-    url = f'https://www.googleapis.com/drive/v3/files/{file_id}'
-    try:
-        r = session.get(url, params={'alt':'media','supportsAllDrives':'true'}, timeout=60)
-    except Exception as exc:
-        raise RuntimeError(f'{label} request failed: {exc}') from exc
-
-    content = r.content or b''
-    if r.status_code >= 400:
-        try:
-            detail = r.json()
-        except Exception:
-            detail = (content[:500].decode('utf-8', errors='replace') if content else r.text[:500])
-        raise RuntimeError(f'{label} HTTP {r.status_code}: {detail}')
-
-    ctype = (r.headers.get('Content-Type') or '').lower()
-    if content.lstrip().startswith(b'{'):
-        # The exact symptom previously seen: Drive metadata JSON was returned
-        # instead of the binary PDF. Surface it as a distinct diagnostic.
-        try:
-            detail = r.json()
-            kind = detail.get('kind') if isinstance(detail, dict) else None
-            name = detail.get('name') if isinstance(detail, dict) else None
-            returned_mime = detail.get('mimeType') if isinstance(detail, dict) else None
-            raise RuntimeError(
-                f'{label} returned JSON instead of binary media '
-                f'(kind={kind!r}, name={name!r}, mimeType={returned_mime!r}, contentType={ctype!r}).'
-            )
-        except RuntimeError:
-            raise
-        except Exception:
-            raise RuntimeError(f'{label} returned JSON instead of binary media (contentType={ctype!r}).')
-
-    return content
-
-
 def drive_read(file_id):
     d=google_service('drive',['https://www.googleapis.com/auth/drive.readonly'])
     fields='id,name,mimeType,size,modifiedTime,webViewLink,webContentLink,shortcutDetails'
@@ -281,7 +288,7 @@ def drive_read(file_id):
         data=_drive_download_bytes(d.files().get(fileId=file_id,alt='media'), 'Text file download')
         return meta,data.decode('utf-8', errors='replace'),None
     if mt=='application/pdf':
-        data=_drive_download_direct(file_id, meta, 'PDF download')
+        data=_drive_download_bytes(d.files().get(fileId=file_id,alt='media'), 'PDF download')
         return meta,None,data
     return meta,'This file type is available in Drive but is not directly extractable by the server.',None
 
@@ -465,11 +472,35 @@ def api_request_otp():
 
 @app.post('/api/auth/verify-otp')
 def api_verify_otp():
-    b=request.get_json(force=True) or {}; email=str(b.get('email','')).strip().lower(); code=str(b.get('code','')).strip()
-    try: verify_otp(email,code); return jsonify(ok=True,verified=True)
+    request_id = getattr(request, 'request_id', secrets.token_hex(12))
+    try:
+        rate_limit('otp-verify:' + client_ip(), maximum=int(os.getenv('OTP_VERIFY_RATE_LIMIT_MAX', '10')))
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify(ok=False, error={'code':'INVALID_JSON','message':'Verification request must contain JSON with email and code.'}, requestId=request_id), 400
+        email = str(payload.get('email', '')).strip().lower()
+        code = str(payload.get('code', '')).strip()
+        if '@' not in email or not code.isdigit() or len(code) != 6:
+            return jsonify(ok=False, error={'code':'VALIDATION_ERROR','message':'Enter a valid email address and 6-digit verification code.'}, requestId=request_id), 422
+        verify_otp(email, code)
+        app.logger.info('OTP verified request_id=%s email=%s', request_id, email)
+        return jsonify(ok=True, verified=True, requestId=request_id), 200
     except RuntimeError as e:
-        if str(e) in ['OTP_EXPIRED','OTP_LOCKED','OTP_INVALID']: return json_error('The verification code is invalid or expired.',400,str(e))
-        return json_error(str(e),500)
+        code_name = str(e)
+        if code_name == 'RATE_LIMITED':
+            return jsonify(ok=False, error={'code':'RATE_LIMITED','message':'Too many verification attempts. Please try again later.'}, requestId=request_id), 429
+        if code_name in {'OTP_EXPIRED','OTP_LOCKED','OTP_INVALID'}:
+            return jsonify(ok=False, error={'code':code_name,'message':'The verification code is invalid or expired.'}, requestId=request_id), 400
+        if code_name == 'DATABASE_UNAVAILABLE':
+            app.logger.error('OTP verification database unavailable request_id=%s', request_id)
+            return jsonify(ok=False, error={'code':'DATABASE_UNAVAILABLE','message':'Verification service is temporarily unavailable. Please try again.'}, requestId=request_id), 503
+        if code_name == 'VALIDATION_ERROR':
+            return jsonify(ok=False, error={'code':'VALIDATION_ERROR','message':'Enter a valid email address and 6-digit verification code.'}, requestId=request_id), 422
+        app.logger.exception('OTP verification runtime error request_id=%s', request_id)
+        return jsonify(ok=False, error={'code':'OTP_VERIFY_FAILED','message':'Unable to verify the code right now. Please try again.'}, requestId=request_id), 500
+    except Exception:
+        app.logger.exception('OTP verification unexpected error request_id=%s', request_id)
+        return jsonify(ok=False, error={'code':'OTP_VERIFY_FAILED','message':'Unable to verify the code right now. Please try again.'}, requestId=request_id), 500
 
 @app.post('/api/leads')
 def api_leads():
@@ -517,29 +548,11 @@ def api_drive_read():
     try:
         meta,text,data=drive_read(fid)
         if data is not None:
-            # Do not use Flask send_file/conditional responses for Drive PDFs on Vercel.
-            # Serverless adapters can mishandle range/conditional file responses, which
-            # makes Chrome report "Failed to load PDF document" even when the bytes
-            # downloaded from Google Drive are valid. Return the already-downloaded bytes
-            # as a normal HTTP response with an explicit PDF content length.
-            if not isinstance(data, (bytes, bytearray)):
-                raise RuntimeError(f'DRIVE_PDF_INVALID_BYTES:{type(data).__name__}')
-            pdf_bytes = bytes(data)
-            if not pdf_bytes.startswith(b'%PDF-'):
-                preview = pdf_bytes[:32].hex()
-                raise RuntimeError(f'DRIVE_PDF_NOT_PDF:downloaded content does not start with PDF signature ({preview})')
-            filename = meta.get('name') or 'document.pdf'
-            if not filename.lower().endswith('.pdf'):
-                filename += '.pdf'
-            response = Response(pdf_bytes, status=200, mimetype='application/pdf')
-            response.headers['Content-Type'] = 'application/pdf'
-            response.headers['Content-Length'] = str(len(pdf_bytes))
-            response.headers['Content-Disposition'] = f'inline; filename="{filename.replace(chr(34), "")}';
-            response.headers['Accept-Ranges'] = 'bytes'
-            response.headers['Cache-Control'] = 'private, no-store, max-age=0'
-            response.headers['X-Drive-File-Id'] = meta.get('id','')
-            response.headers['X-Drive-Mime-Type'] = meta.get('mimeType','')
-            response.headers['X-Drive-Bytes'] = str(len(pdf_bytes))
+            import io
+            response=send_file(io.BytesIO(data),mimetype=meta.get('mimeType') or 'application/octet-stream',download_name=meta.get('name') or 'document',as_attachment=False,conditional=True)
+            response.headers['Cache-Control']='private, no-store'
+            response.headers['X-Drive-File-Id']=meta.get('id','')
+            response.headers['X-Drive-Mime-Type']=meta.get('mimeType','')
             return response
         return jsonify(ok=True,meta=meta,text=text)
     except Exception as e:
