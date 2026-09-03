@@ -1,46 +1,28 @@
-# GLDC Python Production Gap Matrix
+# GLDC Requirements Implementation Matrix
 
-This build is the hosted-environment compatibility and production-hardening release. It does **not** falsely claim that every business module in the full GLDC specification is already implemented.
+The previous V12 package was a foundation and did not satisfy the full specification. This rebuild expands the platform around the actual requirements.
 
-## Already implemented / hardened
+| Area | Rebuild status |
+|---|---|
+| Public website pages | Implemented foundation + expanded consultation/FAQ/insights |
+| CRM leads | Implemented: listing, update, conversion |
+| Clients | Implemented |
+| Projects | Implemented |
+| Tasks | Implemented |
+| Calendar foundation | Implemented from task dates |
+| Quotations | Implemented: creation, PDF, issue, send, decisions/history |
+| Invoices | Implemented: PDF, email, download, resend, status/history |
+| Payments | Implemented ledger + Daraja callback + manual verification records |
+| Financial reports | Implemented basic operational/financial metrics |
+| Documents | Implemented metadata/security/access/version foundation + Drive integration |
+| CMS | Implemented generic CMS collections and editable content records |
+| Notifications | Implemented foundation |
+| Users / roles | Implemented foundation |
+| Audit logs | Implemented for important platform actions |
+| Brand/system settings | Implemented console foundation |
+| Client portal | Architecture/foundation only; phase 2 per specification |
+| Advanced WhatsApp/SMS | Not claimed; phase 2 per specification |
+| Advanced calendar integrations | Not claimed; phase 2 per specification |
+| Advanced document versioning/scanning | Foundation only |
 
-- Public Flask website and responsive templates
-- MongoDB Atlas connection and lazy serverless initialization
-- Session authentication, CSRF, rate limiting, secure cookies
-- Email OTP request/verification path hardening
-- Google Drive service-account listing, pagination, PDF view, and binary download
-- Google Sheets configuration/read foundation
-- Safaricom Daraja STK foundation and callback endpoint
-- Lead/enquiry creation and admin lead listing
-- Basic content/settings management
-- Invoice creation, PDF generation, email delivery, download, resend
-- Health/readiness diagnostics
-- Request IDs and generic JSON API errors
-- Hosted environment aliases and configuration validation
-- Configurable admin path
-- 25 MB upload request limit compatibility
-- Production deployment files for Vercel/Gunicorn/Docker
-
-## Full specification modules that still require full CRUD/workflow implementation
-
-- Clients
-- Projects and project members
-- Tasks/milestones
-- Quotations and quotation version history/acceptance
-- Full invoice lifecycle and immutable financial ledger
-- Payment ledger/reconciliation/refund/reversal workflows
-- Advanced document metadata/versioning/archive/permissions
-- Full Website CMS for pages/services/projects/team/testimonials/media/service areas/blog
-- Calendar and consultation booking
-- Notification center and notification delivery rules
-- Reports and financial analytics
-- Users, roles, granular permissions
-- Audit log viewer and full entity activity timelines
-- Brand settings UI
-- System settings UI
-- Client portal
-- Advanced messaging/WhatsApp/SMS integrations
-- Backup monitoring/restore tooling
-- Analytics/SEO management UI
-
-These modules are part of the supplied GLDC requirements and should be implemented rather than represented by fake/demo statistics or placeholder buttons.
+Before client handover, run the requirements' public, CRM, project, finance, document, user, audit, security and mobile test checklist against the configured production environment.

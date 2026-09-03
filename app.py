@@ -624,6 +624,17 @@ def verify_page(): return render_template('verify.html', title='Verification')
 @app.route('/document')
 @login_required
 def document_page(): return render_template('document.html', title='Documents')
+@app.route('/faq')
+def faq(): return render_template('faq.html', title='Frequently Asked Questions')
+@app.route('/insights')
+def insights():
+    posts=[]
+    if db is not None:
+        try: posts=[clean_doc(x) for x in db.posts.find({'status':'PUBLISHED'}).sort('publishedAt',DESCENDING).limit(50)]
+        except Exception: pass
+    return render_template('insights.html', title='Insights & Resources', posts=posts)
+@app.route('/consultation')
+def consultation(): return render_template('consultation.html', title='Request a Consultation')
 @app.route('/privacy')
 def privacy(): return render_template('privacy.html', title='Privacy Policy')
 @app.route('/terms')
@@ -953,12 +964,274 @@ def api_callback():
         return jsonify(ResultCode=0,ResultDesc='Accepted')
     except Exception: return jsonify(ResultCode=0,ResultDesc='Accepted')
 
+@app.post('/api/consultations')
+def public_consultation():
+    b=request.get_json(silent=True) or {}; name=str(b.get('name','')).strip(); email=str(b.get('email','')).strip().lower(); preferred=str(b.get('preferredDate','')).strip();
+    if not name or '@' not in email: return json_error('Name and valid email are required.',422,'VALIDATION_ERROR')
+    cid=make_id('CON'); doc={'id':cid,'name':name,'email':email,'phone':str(b.get('phone','')).strip(),'service':str(b.get('service','')).strip(),'preferredDate':preferred,'message':str(b.get('message','')).strip(),'status':'REQUESTED','createdAt':now()}
+    db.consultations.insert_one(doc); db.leads.insert_one({'id':make_id('LED'),'name':name,'email':email,'phone':doc['phone'],'service':doc['service'],'message':doc['message'],'status':'NEW','source':'CONSULTATION','createdAt':now(),'updatedAt':now()}); audit('CONSULTATION_REQUESTED','consultation',cid); return jsonify(ok=True,id=cid,message='Consultation request received.')
+
+@app.get('/api/admin/consultations')
+@admin_required
+def admin_consultations(): return jsonify(ok=True,consultations=list_collection('consultations'))
+
 @app.get('/api/public/content')
 def api_public_content():
     try:
         s=db.settings.find_one({'key':'public'}) if db is not None else None; content=list(db.content.find({'public':True},{'_id':0,'key':1,'value':1})) if db is not None else []
         return jsonify(ok=True,settings={k:s.get(k) for k in ['company','phone','email','location','hours','tagline']} if s else None,content=content)
     except Exception: return jsonify(ok=False,error={'code':'CONTENT_UNAVAILABLE','message':'Public content is temporarily unavailable.'}),503
+
+
+
+@app.patch('/api/admin/leads/<lead_id>')
+@admin_required
+def admin_lead_update(lead_id):
+    b=request.get_json(silent=True) or {}; allowed=['status','assignedTo','notes','followUpAt','priority','source']; update={k:b[k] for k in allowed if k in b}; update['updatedAt']=now(); db.leads.update_one({'id':lead_id},{'$set':update}); audit('LEAD_UPDATED','lead',lead_id,update); return jsonify(ok=True)
+
+@app.post('/api/admin/leads/<lead_id>/convert')
+@admin_required
+def admin_lead_convert(lead_id):
+    lead=db.leads.find_one({'id':lead_id},{'_id':0});
+    if not lead: return json_error('Lead not found.',404,'LEAD_NOT_FOUND')
+    existing=db.clients.find_one({'email':str(lead.get('email','')).lower()});
+    if existing: cid=existing.get('id')
+    else:
+        cid=make_id('CLI'); db.clients.insert_one({'id':cid,'name':lead.get('name',''),'email':str(lead.get('email','')).lower(),'phone':lead.get('phone',''),'company':lead.get('company',''),'address':lead.get('town',''),'notes':lead.get('message',''),'status':'ACTIVE','sourceLeadId':lead_id,'createdAt':now(),'updatedAt':now(),'createdBy':current_user().get('email')})
+    db.leads.update_one({'id':lead_id},{'$set':{'status':'CONVERTED','clientId':cid,'updatedAt':now()}}); audit('LEAD_CONVERTED','lead',lead_id,{'clientId':cid}); return jsonify(ok=True,clientId=cid)
+
+@app.post('/api/admin/quotations/<quote_number>/decision')
+@admin_required
+def admin_quote_decision(quote_number):
+    b=request.get_json(silent=True) or {}; status=str(b.get('status','')).upper();
+    if status not in {'ACCEPTED','REJECTED','CHANGES REQUESTED'}: return json_error('Invalid quotation decision.',422,'VALIDATION_ERROR')
+    q=db.quotations.find_one({'quoteNumber':quote_number});
+    if not q: return json_error('Quotation not found.',404,'QUOTE_NOT_FOUND')
+    db.quotations.update_one({'_id':q['_id']},{'$set':{'status':status,'decisionAt':now(),'decisionNote':str(b.get('note',''))},'$push':{'history':{'status':status,'at':now(),'by':current_user().get('email')}}}); audit('QUOTE_DECISION','quotation',quote_number,{'status':status}); return jsonify(ok=True,status=status)
+
+# ================= GLDC FULL PLATFORM MODULES =================
+# Connected CRM -> Client -> Project -> Tasks -> Quote -> Invoice -> Payment -> Documents workflow.
+def audit(action, entity, entity_id=None, details=None):
+    try:
+        db.audit.insert_one({'action':action,'entity':entity,'entityId':entity_id,'details':details or {},'actor':(current_user() or {}).get('email'),'createdAt':now()})
+    except Exception:
+        app.logger.exception('Audit write failed')
+
+def clean_doc(d):
+    d=dict(d or {})
+    d.pop('_id',None)
+    for k,v in list(d.items()):
+        if hasattr(v,'isoformat'): d[k]=v.isoformat()
+        elif k=='_id': d[k]=str(v)
+    return d
+
+def make_id(prefix): return prefix+'-'+datetime.now(timezone.utc).strftime('%Y%m%d')+'-'+secrets.token_hex(4).upper()
+
+def quote_pdf(q):
+    buf=BytesIO(); c=canvas.Canvas(buf,pagesize=A4); w,h=A4
+    c.setFont('Helvetica-Bold',20); c.drawString(25*mm,h-28*mm,'Gavin Land & Design Consultants')
+    c.setFont('Helvetica',9); c.drawString(25*mm,h-35*mm,'LAND • DESIGN • DEVELOPMENT • CONSULTANCY')
+    c.setFont('Helvetica-Bold',16); c.drawRightString(w-25*mm,h-28*mm,'QUOTATION')
+    c.setFont('Helvetica',9); c.drawRightString(w-25*mm,h-35*mm,q.get('quoteNumber',''))
+    y=h-58*mm; c.setFont('Helvetica-Bold',10); c.drawString(25*mm,y,'CLIENT')
+    c.setFont('Helvetica',10); c.drawString(25*mm,y-7*mm,q.get('clientName','')); c.drawString(25*mm,y-14*mm,q.get('clientEmail',''))
+    c.setFont('Helvetica-Bold',10); c.drawRightString(w-25*mm,y,'DATE'); c.setFont('Helvetica',10); c.drawRightString(w-25*mm,y-7*mm,str(q.get('createdAt',''))[:10])
+    y-=35*mm; c.setFont('Helvetica-Bold',10); c.drawString(25*mm,y,'SCOPE / DESCRIPTION'); c.drawRightString(w-25*mm,y,'AMOUNT')
+    c.line(25*mm,y-3*mm,w-25*mm,y-3*mm); c.setFont('Helvetica',10); c.drawString(25*mm,y-12*mm,str(q.get('description',''))[:100]); c.drawRightString(w-25*mm,y-12*mm,f"KES {float(q.get('amount',0)):,.2f}")
+    c.line(25*mm,y-20*mm,w-25*mm,y-20*mm); c.setFont('Helvetica-Bold',12); c.drawRightString(w-25*mm,y-32*mm,f"TOTAL: KES {float(q.get('amount',0)):,.2f}")
+    c.setFont('Helvetica',9); c.drawString(25*mm,25*mm,'This quotation is subject to GLDC approval and the terms stated in the proposal.')
+    c.save(); return buf.getvalue()
+
+def list_collection(name, limit=200): return [clean_doc(x) for x in db[name].find({}).sort('createdAt',DESCENDING).limit(limit)]
+
+@app.get('/api/admin/clients')
+@admin_required
+def admin_clients(): return jsonify(ok=True,clients=list_collection('clients'))
+
+@app.post('/api/admin/clients')
+@admin_required
+def admin_client_create():
+    b=request.get_json(silent=True) or {}; email=str(b.get('email','')).strip().lower(); name=str(b.get('name','')).strip()
+    if not name or '@' not in email: return json_error('Client name and valid email are required.',422,'VALIDATION_ERROR')
+    cid=make_id('CLI'); doc={'id':cid,'name':name,'email':email,'phone':str(b.get('phone','')).strip(),'company':str(b.get('company','')).strip(),'address':str(b.get('address','')).strip(),'notes':str(b.get('notes','')).strip(),'status':'ACTIVE','createdAt':now(),'updatedAt':now(),'createdBy':current_user().get('email')}
+    db.clients.insert_one(doc); audit('CLIENT_CREATED','client',cid); return jsonify(ok=True,client=clean_doc(doc)),201
+
+@app.patch('/api/admin/clients/<client_id>')
+@admin_required
+def admin_client_update(client_id):
+    b=request.get_json(silent=True) or {}; allowed=['name','email','phone','company','address','notes','status']
+    update={k:b[k] for k in allowed if k in b}; update['updatedAt']=now(); db.clients.update_one({'id':client_id},{'$set':update}); audit('CLIENT_UPDATED','client',client_id,update); return jsonify(ok=True)
+
+@app.get('/api/admin/projects')
+@admin_required
+def admin_projects(): return jsonify(ok=True,projects=list_collection('projects'))
+
+@app.post('/api/admin/projects')
+@admin_required
+def admin_project_create():
+    b=request.get_json(silent=True) or {}; name=str(b.get('name','')).strip(); client_id=str(b.get('clientId','')).strip()
+    if not name or not client_id: return json_error('Project name and client are required.',422,'VALIDATION_ERROR')
+    client=db.clients.find_one({'id':client_id},{'_id':0})
+    if not client: return json_error('Client not found.',404,'CLIENT_NOT_FOUND')
+    pid=make_id('PRJ'); doc={'id':pid,'name':name,'clientId':client_id,'clientName':client.get('name'),'location':str(b.get('location','')).strip(),'service':str(b.get('service','')).strip(),'description':str(b.get('description','')).strip(),'status':str(b.get('status','PLANNING')).upper(),'priority':str(b.get('priority','NORMAL')).upper(),'startDate':str(b.get('startDate','')).strip(),'dueDate':str(b.get('dueDate','')).strip(),'manager':str(b.get('manager','')).strip(),'budget':float(b.get('budget') or 0),'progress':int(b.get('progress') or 0),'createdAt':now(),'updatedAt':now(),'createdBy':current_user().get('email')}
+    db.projects.insert_one(doc); audit('PROJECT_CREATED','project',pid); return jsonify(ok=True,project=clean_doc(doc)),201
+
+@app.patch('/api/admin/projects/<project_id>')
+@admin_required
+def admin_project_update(project_id):
+    b=request.get_json(silent=True) or {}; allowed=['name','location','service','description','status','priority','startDate','dueDate','manager','budget','progress','clientId']
+    update={k:b[k] for k in allowed if k in b}; update['updatedAt']=now(); db.projects.update_one({'id':project_id},{'$set':update}); audit('PROJECT_UPDATED','project',project_id,update); return jsonify(ok=True)
+
+@app.get('/api/admin/tasks')
+@admin_required
+def admin_tasks():
+    project=request.args.get('projectId'); q={'projectId':project} if project else {}; return jsonify(ok=True,tasks=list_collection('tasks') if not project else [clean_doc(x) for x in db.tasks.find(q).sort('createdAt',DESCENDING).limit(500)])
+
+@app.post('/api/admin/tasks')
+@admin_required
+def admin_task_create():
+    b=request.get_json(silent=True) or {}; title=str(b.get('title','')).strip(); project_id=str(b.get('projectId','')).strip()
+    if not title or not project_id: return json_error('Task title and project are required.',422,'VALIDATION_ERROR')
+    tid=make_id('TSK'); doc={'id':tid,'title':title,'projectId':project_id,'assignee':str(b.get('assignee','')).strip(),'description':str(b.get('description','')).strip(),'status':str(b.get('status','TODO')).upper(),'priority':str(b.get('priority','NORMAL')).upper(),'dueDate':str(b.get('dueDate','')).strip(),'createdAt':now(),'updatedAt':now(),'createdBy':current_user().get('email')}
+    db.tasks.insert_one(doc); audit('TASK_CREATED','task',tid); return jsonify(ok=True,task=clean_doc(doc)),201
+
+@app.patch('/api/admin/tasks/<task_id>')
+@admin_required
+def admin_task_update(task_id):
+    b=request.get_json(silent=True) or {}; allowed=['title','assignee','description','status','priority','dueDate']; update={k:b[k] for k in allowed if k in b}; update['updatedAt']=now(); db.tasks.update_one({'id':task_id},{'$set':update}); audit('TASK_UPDATED','task',task_id,update); return jsonify(ok=True)
+
+@app.get('/api/admin/quotations')
+@admin_required
+def admin_quotes(): return jsonify(ok=True,quotations=list_collection('quotations'))
+
+@app.post('/api/admin/quotations')
+@admin_required
+def admin_quote_create():
+    b=request.get_json(silent=True) or {}; client_id=str(b.get('clientId','')).strip(); amount=float(b.get('amount') or 0); desc=str(b.get('description','')).strip()
+    client=db.clients.find_one({'id':client_id},{'_id':0}) if client_id else None
+    if not client or amount<=0 or not desc: return json_error('Client, positive amount and description are required.',422,'VALIDATION_ERROR')
+    qn='GLDC-QT-'+datetime.now(timezone.utc).strftime('%Y%m%d')+'-'+secrets.token_hex(3).upper(); existing=db.quotations.count_documents({'clientId':client_id}); doc={'quoteNumber':qn,'version':existing+1,'clientId':client_id,'clientName':client.get('name'),'clientEmail':client.get('email'),'projectId':str(b.get('projectId','')).strip() or None,'description':desc,'amount':round(amount,2),'currency':CURRENCY,'status':'DRAFT','validUntil':str(b.get('validUntil','')).strip(),'createdAt':now(),'updatedAt':now(),'createdBy':current_user().get('email'),'history':[]}
+    db.quotations.insert_one(doc); audit('QUOTE_CREATED','quotation',qn); return jsonify(ok=True,quotation=clean_doc(doc)),201
+
+@app.post('/api/admin/quotations/<quote_number>/issue')
+@admin_required
+def admin_quote_issue(quote_number):
+    q=db.quotations.find_one({'quoteNumber':quote_number});
+    if not q: return json_error('Quotation not found.',404,'QUOTE_NOT_FOUND')
+    db.quotations.update_one({'_id':q['_id']},{'$set':{'status':'ISSUED','issuedAt':now()},'$push':{'history':{'status':'ISSUED','at':now(),'by':current_user().get('email')}}}); audit('QUOTE_ISSUED','quotation',quote_number); return jsonify(ok=True,status='ISSUED')
+
+@app.get('/api/admin/quotations/<quote_number>/download')
+@admin_required
+def admin_quote_download(quote_number):
+    q=db.quotations.find_one({'quoteNumber':quote_number},{'_id':0});
+    if not q: return json_error('Quotation not found.',404,'QUOTE_NOT_FOUND')
+    data=quote_pdf(q); r=Response(data,mimetype='application/pdf'); r.headers['Content-Disposition']=f'attachment; filename="{quote_number}.pdf"'; r.headers['Content-Length']=str(len(data)); r.headers['Cache-Control']='private, no-store'; return r
+
+@app.post('/api/admin/quotations/<quote_number>/send')
+@admin_required
+def admin_quote_send(quote_number):
+    q=db.quotations.find_one({'quoteNumber':quote_number},{'_id':0});
+    if not q: return json_error('Quotation not found.',404,'QUOTE_NOT_FOUND')
+    data=quote_pdf(q); send_email(q['clientEmail'],f'GLDC Quotation {quote_number}',f'Please find attached quotation {quote_number}.',f'<p>Please find attached your GLDC quotation <strong>{quote_number}</strong>.</p>',[(quote_number+'.pdf',data,'application/pdf')]); db.quotations.update_one({'quoteNumber':quote_number},{'$set':{'status':'SENT','sentAt':now()},'$push':{'history':{'status':'SENT','at':now(),'by':current_user().get('email')}}}); audit('QUOTE_SENT','quotation',quote_number); return jsonify(ok=True)
+
+@app.get('/api/admin/payments')
+@admin_required
+def admin_payments(): return jsonify(ok=True,payments=list_collection('payments'))
+
+@app.post('/api/admin/payments/manual')
+@admin_required
+def admin_manual_payment():
+    b=request.get_json(silent=True) or {}; amount=float(b.get('amount') or 0); invoice=str(b.get('invoiceNumber','')).strip(); ref=str(b.get('reference','')).strip();
+    if amount<=0 or len(ref)<3: return json_error('Amount and reference are required.',422,'VALIDATION_ERROR')
+    pid=make_id('PAY'); doc={'id':pid,'invoiceNumber':invoice or None,'clientId':str(b.get('clientId','')).strip() or None,'projectId':str(b.get('projectId','')).strip() or None,'amount':round(amount,2),'currency':CURRENCY,'method':str(b.get('method','BANK_TRANSFER')).upper(),'reference':ref,'status':'MANUALLY VERIFIED','source':'MANUAL','recordedBy':current_user().get('email'),'createdAt':now(),'updatedAt':now(),'notes':str(b.get('notes','')).strip()}
+    db.payments.insert_one(doc); audit('PAYMENT_MANUALLY_VERIFIED','payment',pid,{'amount':amount,'reference':ref}); return jsonify(ok=True,payment=clean_doc(doc)),201
+
+@app.post('/api/admin/invoices/<invoice_number>/status')
+@admin_required
+def admin_invoice_status(invoice_number):
+    b=request.get_json(silent=True) or {}; status=str(b.get('status','')).upper(); allowed={'DRAFT','ISSUED','PARTIALLY PAID','PAID','OVERDUE','VOID','CANCELLED','SENT'}
+    if status not in allowed: return json_error('Invalid invoice status.',422,'VALIDATION_ERROR')
+    inv=db.invoices.find_one({'invoiceNumber':invoice_number});
+    if not inv: return json_error('Invoice not found.',404,'INVOICE_NOT_FOUND')
+    db.invoices.update_one({'_id':inv['_id']},{'$set':{'status':status,'updatedAt':now()},'$push':{'history':{'status':status,'at':now(),'by':current_user().get('email')}}}); audit('INVOICE_STATUS_CHANGED','invoice',invoice_number,{'status':status}); return jsonify(ok=True,status=status)
+
+@app.get('/api/admin/documents')
+@admin_required
+def admin_documents(): return jsonify(ok=True,documents=list_collection('documents'))
+
+@app.post('/api/admin/documents')
+@admin_required
+def admin_document_create():
+    b=request.get_json(silent=True) or {}; name=str(b.get('name','')).strip();
+    if not name: return json_error('Document name is required.',422,'VALIDATION_ERROR')
+    did=make_id('DOC'); doc={'id':did,'name':name,'category':str(b.get('category','OTHER')).upper(),'projectId':str(b.get('projectId','')).strip() or None,'clientId':str(b.get('clientId','')).strip() or None,'driveFileId':str(b.get('driveFileId','')).strip() or None,'version':int(b.get('version') or 1),'fileType':str(b.get('fileType','')).strip(),'fileSize':int(b.get('fileSize') or 0),'accessLevel':str(b.get('accessLevel','PRIVATE')).upper(),'description':str(b.get('description','')).strip(),'status':'ACTIVE','uploadedBy':current_user().get('email'),'createdAt':now(),'updatedAt':now()}
+    db.documents.insert_one(doc); audit('DOCUMENT_CREATED','document',did); return jsonify(ok=True,document=clean_doc(doc)),201
+
+@app.patch('/api/admin/documents/<doc_id>')
+@admin_required
+def admin_document_update(doc_id):
+    b=request.get_json(silent=True) or {}; allowed=['category','projectId','clientId','version','accessLevel','description','status']; update={k:b[k] for k in allowed if k in b}; update['updatedAt']=now(); db.documents.update_one({'id':doc_id},{'$set':update}); audit('DOCUMENT_UPDATED','document',doc_id,update); return jsonify(ok=True)
+
+@app.get('/api/admin/site/<collection>')
+@admin_required
+def admin_site_list(collection):
+    if collection not in {'services','site_projects','team','testimonials','posts','service_areas','faqs','pages'}: return json_error('Unsupported CMS collection.',404,'CMS_COLLECTION_NOT_FOUND')
+    return jsonify(ok=True,items=list_collection(collection,500))
+
+@app.post('/api/admin/site/<collection>')
+@admin_required
+def admin_site_create(collection):
+    if collection not in {'services','site_projects','team','testimonials','posts','service_areas','faqs','pages'}: return json_error('Unsupported CMS collection.',404,'CMS_COLLECTION_NOT_FOUND')
+    b=request.get_json(silent=True) or {}; title=str(b.get('title') or b.get('name') or '').strip()
+    if not title: return json_error('Title/name is required.',422,'VALIDATION_ERROR')
+    sid=make_id(collection[:3].upper()); doc=dict(b); doc.update({'id':sid,'title':title,'status':str(b.get('status','DRAFT')).upper(),'createdAt':now(),'updatedAt':now(),'createdBy':current_user().get('email')}); db[collection].insert_one(doc); audit('CMS_CREATED',collection,sid); return jsonify(ok=True,item=clean_doc(doc)),201
+
+@app.patch('/api/admin/site/<collection>/<item_id>')
+@admin_required
+def admin_site_update(collection,item_id):
+    if collection not in {'services','site_projects','team','testimonials','posts','service_areas','faqs','pages'}: return json_error('Unsupported CMS collection.',404,'CMS_COLLECTION_NOT_FOUND')
+    b=request.get_json(silent=True) or {}; b['updatedAt']=now(); db[collection].update_one({'id':item_id},{'$set':b}); audit('CMS_UPDATED',collection,item_id,b); return jsonify(ok=True)
+
+@app.get('/api/admin/notifications')
+@admin_required
+def admin_notifications(): return jsonify(ok=True,notifications=list_collection('notifications'))
+
+@app.post('/api/admin/notifications')
+@admin_required
+def admin_notification_create():
+    b=request.get_json(silent=True) or {}; title=str(b.get('title','')).strip(); message=str(b.get('message','')).strip();
+    if not title or not message: return json_error('Title and message are required.',422,'VALIDATION_ERROR')
+    nid=make_id('NTF'); doc={'id':nid,'title':title,'message':message,'type':str(b.get('type','INFO')).upper(),'audience':str(b.get('audience','ADMIN')).upper(),'read':False,'createdAt':now(),'createdBy':current_user().get('email')}; db.notifications.insert_one(doc); audit('NOTIFICATION_CREATED','notification',nid); return jsonify(ok=True,notification=clean_doc(doc)),201
+
+@app.get('/api/admin/audit')
+@admin_required
+def admin_audit(): return jsonify(ok=True,audit=list_collection('audit',500))
+
+@app.get('/api/admin/users')
+@admin_required
+def admin_users(): return jsonify(ok=True,users=[clean_doc(x) for x in db.users.find({}, {'passwordHash':0}).sort('createdAt',DESCENDING).limit(200)])
+
+@app.post('/api/admin/users')
+@admin_required
+def admin_user_create():
+    b=request.get_json(silent=True) or {}; email=str(b.get('email','')).strip().lower(); name=str(b.get('name','')).strip(); password=str(b.get('password','')); role=str(b.get('role','STAFF')).upper()
+    if '@' not in email or not name or len(password)<12: return json_error('Name, valid email and 12+ character password are required.',422,'VALIDATION_ERROR')
+    if db.users.find_one({'email':email}): return json_error('User already exists.',409,'USER_EXISTS')
+    uid=make_id('USR'); doc={'id':uid,'email':email,'name':name,'passwordHash':hash_password(password),'role':role,'status':'ACTIVE','createdAt':now(),'updatedAt':now()}; db.users.insert_one(doc); audit('USER_CREATED','user',uid,{'email':email,'role':role}); doc.pop('passwordHash',None); return jsonify(ok=True,user=clean_doc(doc)),201
+
+@app.get('/api/admin/reports')
+@admin_required
+def admin_reports():
+    def total(col, query={}): return db[col].count_documents(query)
+    paid=db.payments.aggregate([{'$match':{'status':{'$in':['SUCCESSFUL','MANUALLY VERIFIED']}}},{'$group':{'_id':None,'total':{'$sum':'$amount'}}}]); paid=list(paid); revenue=float(paid[0]['total']) if paid else 0
+    outstanding=sum(float(x.get('amount',0)) for x in db.invoices.find({'status':{'$in':['ISSUED','SENT','PARTIALLY PAID','OVERDUE']}}))
+    return jsonify(ok=True,metrics={'leads':total('leads'),'clients':total('clients'),'projects':total('projects'),'tasks':total('tasks'),'quotations':total('quotations'),'invoices':total('invoices'),'documents':total('documents'),'payments':total('payments'),'revenue':revenue,'outstanding':outstanding})
+
+@app.get('/api/admin/calendar')
+@admin_required
+def admin_calendar():
+    tasks=[clean_doc(x) for x in db.tasks.find({'dueDate':{'$ne':''}}).limit(500)]; return jsonify(ok=True,events=[{'id':x['id'],'title':x['title'],'date':x.get('dueDate'),'type':'TASK','status':x.get('status')} for x in tasks])
+
 
 @app.errorhandler(400)
 def bad_request(e):
@@ -999,6 +1272,18 @@ def init_database():
     db.settings.create_index([('key',ASCENDING)], unique=True)
     db.rate_limits.create_index([('createdAt',ASCENDING)], expireAfterSeconds=7200)
     db.audit.create_index([('createdAt',DESCENDING)])
+    for collection in ['clients','projects','tasks','quotations','documents','notifications']:
+        db[collection].create_index([('createdAt',DESCENDING)])
+    db.quotations.create_index([('quoteNumber',ASCENDING)], unique=True)
+    db.documents.create_index([('projectId',ASCENDING),('category',ASCENDING)])
+    db.projects.create_index([('clientId',ASCENDING),('status',ASCENDING)])
+    db.posts.create_index([('status',ASCENDING),('publishedAt',DESCENDING)])
+    db.consultations.create_index([('scheduledAt',ASCENDING),('status',ASCENDING)])
+    defaults={'home.heroTitle':'Land. Design. Development. Done Right.','home.heroText':'Professional land, planning, design and development consultancy for clients who need practical outcomes.','home.primaryCta':'REQUEST A QUOTE','home.secondaryCta':'VIEW PROJECTS','site.company':'Gavin Land & Design Consultants','site.tagline':'Land • Design • Development • Consultancy','site.phone':'+254','site.email':'info@yourdomain.co.ke','site.location':'Kenya'}
+    for key,value in defaults.items(): db.content.update_one({'key':key},{'$setOnInsert':{'key':key,'value':value,'public':True,'createdAt':now()}},upsert=True)
+    db.tasks.create_index([('projectId',ASCENDING),('status',ASCENDING)])
+    for collection in ['services','site_projects','team','testimonials','posts','service_areas','faqs','pages']:
+        db[collection].create_index([('status',ASCENDING),('updatedAt',DESCENDING)])
 
 _database_initialized = False
 _database_init_error = None
