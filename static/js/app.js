@@ -14,10 +14,8 @@
   };
   window.GLDCApi = { async request(url, options = {}) {
     const r = await fetch(url, options);
-    const text = await r.text();
-    let j = {};
-    try { j = text ? JSON.parse(text) : {}; } catch (_) { j = { ok: false, error: { code: 'NON_JSON_RESPONSE', message: text || 'The server returned an empty response.' } }; }
-    if (!r.ok) { const err = new Error(j.error?.message || j.message || `Request failed (${r.status})`); err.status = r.status; err.code = j.error?.code; err.requestId = j.requestId || r.headers.get('X-Request-ID'); throw err; }
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error?.message || 'Request failed');
     return j;
   }};
 })();
