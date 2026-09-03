@@ -1,4 +1,4 @@
-import os, re, json, base64, hashlib, secrets, smtplib
+import os, re, json, base64, hashlib, secrets, smtplib, time, traceback
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from email.message import EmailMessage
@@ -118,7 +118,14 @@ def request_otp(email):
 
 
 def verify_otp(email, code):
-    email=email.lower().strip(); x=db.otps.find_one({'email':email}, sort=[('createdAt',DESCENDING)])
+    if db is None:
+        raise RuntimeError('DATABASE_UNAVAILABLE')
+    email=email.lower().strip()
+    if not email or '@' not in email:
+        raise RuntimeError('VALIDATION_ERROR')
+    if not code or not code.isdigit() or len(code) != 6:
+        raise RuntimeError('OTP_INVALID')
+    x=db.otps.find_one({'email':email}, sort=[('createdAt',DESCENDING)])
     max_attempts=int(os.getenv('OTP_MAX_ATTEMPTS','5'))
     if not x or x['expiresAt'] < now(): raise RuntimeError('OTP_EXPIRED')
     if x.get('attempts',0)>=max_attempts: raise RuntimeError('OTP_LOCKED')
@@ -185,20 +192,53 @@ def drive_files():
     return r.get('files',[])
 
 
+def _drive_download_bytes(http_request, label='Drive download'):
+    """Download Drive media/export content into bytes safely."""
+    import io
+    from googleapiclient.http import MediaIoBaseDownload
+
+    buffer = io.BytesIO()
+    downloader = MediaIoBaseDownload(buffer, http_request, chunksize=1024 * 1024)
+    done = False
+    try:
+        while not done:
+            _, done = downloader.next_chunk(num_retries=2)
+    except Exception as exc:
+        raise RuntimeError(f'{label} failed: {exc}') from exc
+
+    data = buffer.getvalue()
+    if not isinstance(data, (bytes, bytearray)):
+        raise RuntimeError(f'{label} returned an invalid response type: {type(data).__name__}')
+    if not data:
+        raise RuntimeError(f'{label} returned an empty file.')
+    return bytes(data)
+
+
 def drive_read(file_id):
     d=google_service('drive',['https://www.googleapis.com/auth/drive.readonly'])
-    meta=d.files().get(fileId=file_id,fields='id,name,mimeType,size,modifiedTime,webViewLink',supportsAllDrives=True).execute()
+    fields='id,name,mimeType,size,modifiedTime,webViewLink,webContentLink,shortcutDetails'
+    meta=d.files().get(fileId=file_id,fields=fields,supportsAllDrives=True).execute()
+
+    # Resolve Drive shortcuts before attempting the media request.
+    shortcut=meta.get('shortcutDetails') or {}
+    if meta.get('mimeType') == 'application/vnd.google-apps.shortcut' and shortcut.get('targetId'):
+        file_id=shortcut['targetId']
+        meta=d.files().get(fileId=file_id,fields=fields,supportsAllDrives=True).execute()
+
     mt=meta.get('mimeType','')
     if mt=='application/vnd.google-apps.document':
-        text=d.files().export(fileId=file_id,mimeType='text/plain').execute().decode('utf-8'); return meta,text,None
+        data=_drive_download_bytes(d.files().export(fileId=file_id,mimeType='text/plain'), 'Google Docs export')
+        return meta,data.decode('utf-8', errors='replace'),None
     if mt=='application/vnd.google-apps.spreadsheet':
-        text=d.files().export(fileId=file_id,mimeType='text/csv').execute().decode('utf-8'); return meta,text,None
+        data=_drive_download_bytes(d.files().export(fileId=file_id,mimeType='text/csv'), 'Google Sheets export')
+        return meta,data.decode('utf-8', errors='replace'),None
     if mt.startswith('text/'):
-        text=d.files().get(fileId=file_id,alt='media').execute().decode('utf-8'); return meta,text,None
+        data=_drive_download_bytes(d.files().get(fileId=file_id,alt='media'), 'Text file download')
+        return meta,data.decode('utf-8', errors='replace'),None
     if mt=='application/pdf':
-        data=d.files().get(fileId=file_id,alt='media').execute(); return meta,None,data
+        data=_drive_download_bytes(d.files().get(fileId=file_id,alt='media'), 'PDF download')
+        return meta,None,data
     return meta,'This file type is available in Drive but is not directly extractable by the server.',None
-
 
 def daraja_token():
     base='https://api.safaricom.co.ke' if os.getenv('DARAJA_ENV','production')=='production' else 'https://sandbox.safaricom.co.ke'
@@ -279,7 +319,23 @@ def globals_(): return {'current_user':current_user(),'currency':CURRENCY,'year'
 
 @app.get('/api/health')
 def api_health():
-    return jsonify(ok=True, service='gldc', environment=APP_ENV, requestId=request.request_id), 200
+    # Liveness + real MongoDB connectivity check for the admin dashboard.
+    # This endpoint is intentionally exempt from lazy DB initialization so it
+    # can diagnose configuration/connectivity without causing an import crash.
+    started = time.perf_counter()
+    if db is None:
+        return jsonify(ok=False, service='gldc', environment=APP_ENV, status='DEGRADED',
+                       database='NOT_CONFIGURED', latencyMs=round((time.perf_counter()-started)*1000, 2),
+                       requestId=request.request_id), 503
+    try:
+        db.client.admin.command('ping')
+        latency = round((time.perf_counter()-started)*1000, 2)
+        return jsonify(ok=True, service='gldc', environment=APP_ENV, status='LIVE',
+                       database='CONNECTED', latencyMs=latency, requestId=request.request_id), 200
+    except Exception:
+        latency = round((time.perf_counter()-started)*1000, 2)
+        return jsonify(ok=False, service='gldc', environment=APP_ENV, status='DEGRADED',
+                       database='UNREACHABLE', latencyMs=latency, requestId=request.request_id), 503
 
 @app.get('/api/ready')
 def api_ready():
@@ -364,11 +420,32 @@ def api_request_otp():
 
 @app.post('/api/auth/verify-otp')
 def api_verify_otp():
-    b=request.get_json(force=True) or {}; email=str(b.get('email','')).strip().lower(); code=str(b.get('code','')).strip()
-    try: verify_otp(email,code); return jsonify(ok=True,verified=True)
+    request_id=getattr(request, 'request_id', secrets.token_hex(12))
+    try:
+        payload=request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return json_error('Verification request must contain JSON with email and code.',400,'INVALID_JSON')
+        email=str(payload.get('email','')).strip().lower()
+        code=str(payload.get('code','')).strip()
+        if '@' not in email or not code.isdigit() or len(code) != 6:
+            return json_error('Enter a valid email address and 6-digit verification code.',422,'VALIDATION_ERROR')
+        verify_otp(email, code)
+        app.logger.info('OTP verified request_id=%s email=%s', request_id, email)
+        return jsonify(ok=True, verified=True, requestId=request_id), 200
     except RuntimeError as e:
-        if str(e) in ['OTP_EXPIRED','OTP_LOCKED','OTP_INVALID']: return json_error('The verification code is invalid or expired.',400,str(e))
-        return json_error(str(e),500)
+        code_name=str(e)
+        if code_name in ['OTP_EXPIRED','OTP_LOCKED','OTP_INVALID']:
+            return json_error('The verification code is invalid or expired.',400,code_name)
+        if code_name == 'DATABASE_UNAVAILABLE':
+            app.logger.error('OTP verification database unavailable request_id=%s', request_id)
+            return json_error('Verification service is temporarily unavailable. Please try again.',503,'DATABASE_UNAVAILABLE')
+        if code_name == 'VALIDATION_ERROR':
+            return json_error('Enter a valid email address and 6-digit verification code.',422,'VALIDATION_ERROR')
+        app.logger.exception('OTP verification runtime error request_id=%s', request_id)
+        return json_error('Unable to verify the code right now. Please try again.',500,'OTP_VERIFY_FAILED')
+    except Exception:
+        app.logger.exception('OTP verification unexpected error request_id=%s', request_id)
+        return json_error('Unable to verify the code right now. Please try again.',500,'OTP_VERIFY_FAILED')
 
 @app.post('/api/leads')
 def api_leads():
@@ -411,15 +488,45 @@ def api_drive_files():
 @app.get('/api/drive/read')
 @admin_required
 def api_drive_read():
-    fid=request.args.get('id')
-    if not fid: return json_error('File id is required.')
+    fid=request.args.get('id','').strip()
+    if not fid: return json_error('File id is required.',400,'DRIVE_FILE_ID_REQUIRED')
     try:
         meta,text,data=drive_read(fid)
         if data is not None:
             import io
-            return send_file(io.BytesIO(data),mimetype=meta.get('mimeType') or 'application/octet-stream',download_name=meta.get('name') or 'document',as_attachment=False)
+            response=send_file(io.BytesIO(data),mimetype=meta.get('mimeType') or 'application/octet-stream',download_name=meta.get('name') or 'document',as_attachment=False,conditional=True)
+            response.headers['Cache-Control']='private, no-store'
+            response.headers['X-Drive-File-Id']=meta.get('id','')
+            response.headers['X-Drive-Mime-Type']=meta.get('mimeType','')
+            return response
         return jsonify(ok=True,meta=meta,text=text)
-    except Exception as e: return json_error(str(e),500)
+    except Exception as e:
+        app.logger.exception('Google Drive read failed for file %s', fid)
+        return json_error(str(e),500,'DRIVE_READ_FAILED')
+
+@app.get('/api/drive/debug')
+@admin_required
+def api_drive_debug():
+    """Return safe metadata for diagnosing one Drive file without downloading it."""
+    fid=request.args.get('id','').strip()
+    if not fid: return json_error('File id is required.',400,'DRIVE_FILE_ID_REQUIRED')
+    try:
+        d=google_service('drive',['https://www.googleapis.com/auth/drive.readonly'])
+        meta=d.files().get(fileId=fid,fields='id,name,mimeType,size,modifiedTime,webViewLink,webContentLink,shortcutDetails,capabilities',supportsAllDrives=True).execute()
+        return jsonify(ok=True, file={
+            'id':meta.get('id'),
+            'name':meta.get('name'),
+            'mimeType':meta.get('mimeType'),
+            'size':meta.get('size'),
+            'modifiedTime':meta.get('modifiedTime'),
+            'webViewLink':meta.get('webViewLink'),
+            'webContentLink':meta.get('webContentLink'),
+            'shortcutDetails':meta.get('shortcutDetails'),
+            'canDownload':(meta.get('capabilities') or {}).get('canDownload'),
+        })
+    except Exception as e:
+        app.logger.exception('Google Drive debug failed for file %s', fid)
+        return json_error(str(e),500,'DRIVE_DEBUG_FAILED')
 
 @app.get('/api/drive/sheet')
 @admin_required
