@@ -236,7 +236,10 @@ def security_headers(response):
 
 @app.context_processor
 def inject_security():
-    return {'csrf_token': csrf_token()}
+    # Expose the CSRF token helper itself because templates call csrf_token().
+    # Returning the generated string here would shadow the callable and cause
+    # Jinja to raise: TypeError: 'str' object is not callable.
+    return {'csrf_token': csrf_token}
 
 @app.context_processor
 def globals_(): return {'current_user':current_user(),'currency':CURRENCY,'year':datetime.now().year}
