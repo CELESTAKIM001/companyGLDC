@@ -207,6 +207,58 @@ def _drive_download_bytes(http_request, label='Drive download'):
     return bytes(data)
 
 
+def _drive_download_direct(file_id, meta=None, label='Drive media download'):
+    """Download a Drive binary file using an authenticated HTTPS request.
+
+    This deliberately bypasses the googleapiclient media request wrapper. Some
+    serverless/proxy combinations have returned the Drive *metadata JSON* even
+    though the request was created with alt=media. An AuthorizedSession makes
+    the actual media URL explicit and lets us validate the response before it
+    reaches Flask's PDF response.
+    """
+    import requests as _requests
+    from google.auth.transport.requests import AuthorizedSession
+    from google.oauth2 import service_account
+
+    creds = service_account.Credentials.from_service_account_info(
+        google_creds(), scopes=['https://www.googleapis.com/auth/drive.readonly']
+    )
+    session = AuthorizedSession(creds)
+    url = f'https://www.googleapis.com/drive/v3/files/{file_id}'
+    try:
+        r = session.get(url, params={'alt':'media','supportsAllDrives':'true'}, timeout=60)
+    except Exception as exc:
+        raise RuntimeError(f'{label} request failed: {exc}') from exc
+
+    content = r.content or b''
+    if r.status_code >= 400:
+        try:
+            detail = r.json()
+        except Exception:
+            detail = (content[:500].decode('utf-8', errors='replace') if content else r.text[:500])
+        raise RuntimeError(f'{label} HTTP {r.status_code}: {detail}')
+
+    ctype = (r.headers.get('Content-Type') or '').lower()
+    if content.lstrip().startswith(b'{'):
+        # The exact symptom previously seen: Drive metadata JSON was returned
+        # instead of the binary PDF. Surface it as a distinct diagnostic.
+        try:
+            detail = r.json()
+            kind = detail.get('kind') if isinstance(detail, dict) else None
+            name = detail.get('name') if isinstance(detail, dict) else None
+            returned_mime = detail.get('mimeType') if isinstance(detail, dict) else None
+            raise RuntimeError(
+                f'{label} returned JSON instead of binary media '
+                f'(kind={kind!r}, name={name!r}, mimeType={returned_mime!r}, contentType={ctype!r}).'
+            )
+        except RuntimeError:
+            raise
+        except Exception:
+            raise RuntimeError(f'{label} returned JSON instead of binary media (contentType={ctype!r}).')
+
+    return content
+
+
 def drive_read(file_id):
     d=google_service('drive',['https://www.googleapis.com/auth/drive.readonly'])
     fields='id,name,mimeType,size,modifiedTime,webViewLink,webContentLink,shortcutDetails'
@@ -229,7 +281,7 @@ def drive_read(file_id):
         data=_drive_download_bytes(d.files().get(fileId=file_id,alt='media'), 'Text file download')
         return meta,data.decode('utf-8', errors='replace'),None
     if mt=='application/pdf':
-        data=_drive_download_bytes(d.files().get(fileId=file_id,alt='media'), 'PDF download')
+        data=_drive_download_direct(file_id, meta, 'PDF download')
         return meta,None,data
     return meta,'This file type is available in Drive but is not directly extractable by the server.',None
 
