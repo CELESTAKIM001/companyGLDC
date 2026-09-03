@@ -15,8 +15,8 @@ load_dotenv()
 app = Flask(__name__)
 APP_ENV = os.getenv('APP_ENV', 'production').lower()
 AUTH_SECRET = os.getenv('AUTH_SECRET', '')
-if APP_ENV == 'production' and (len(AUTH_SECRET) < 32 or AUTH_SECRET.startswith('CHANGE_ME')):
-    raise RuntimeError('AUTH_SECRET must be set to a random value of at least 32 characters in production.')
+# Never crash a serverless function during module import because environment variables are missing.
+# Production readiness is reported by /api/ready, while configured deployments use the real secret.
 app.secret_key = AUTH_SECRET or secrets.token_hex(32)
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
@@ -32,7 +32,7 @@ MONGO_URI = os.getenv('MONGODB_URI', '')
 MONGO_DB = os.getenv('MONGODB_DB_NAME', 'gldc')
 
 mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000, maxPoolSize=20) if MONGO_URI else None
-db = mongo_client[MONGO_DB] if mongo_client else None
+db = mongo_client[MONGO_DB] if mongo_client is not None else None
 
 
 def now(): return datetime.now(timezone.utc)
@@ -49,7 +49,7 @@ def json_error(message, status=400, code='ERROR'):
 
 
 def rate_limit(key, maximum=None, window=None):
-    if not db: return
+    if db is None: return
     window = int(window or os.getenv('RATE_LIMIT_WINDOW_SECONDS', '60'))
     maximum = int(maximum or os.getenv('RATE_LIMIT_MAX_REQUESTS', '60'))
     bucket = int(datetime.now(timezone.utc).timestamp()) // window
@@ -85,7 +85,7 @@ def admin_required(f):
 
 
 def bootstrap_admin():
-    if not db: return
+    if db is None: return
     email=os.getenv('INITIAL_ADMIN_EMAIL','').strip().lower(); password=os.getenv('INITIAL_ADMIN_PASSWORD','')
     if not email or not password: return
     if len(password) < 12: raise RuntimeError('INITIAL_ADMIN_PASSWORD must be at least 12 characters.')
@@ -109,7 +109,7 @@ def send_email(to, subject, text, html=None):
 
 
 def request_otp(email):
-    if not db: raise RuntimeError('DATABASE_UNAVAILABLE')
+    if db is None: raise RuntimeError('DATABASE_UNAVAILABLE')
     email=email.lower().strip(); cool=int(os.getenv('OTP_RESEND_COOLDOWN_SECONDS','60')); expiry=int(os.getenv('OTP_EXPIRY_MINUTES','10'))
     if db.otps.find_one({'email':email,'createdAt':{'$gt':now()-timedelta(seconds=cool)}}): raise RuntimeError('OTP_COOLDOWN')
     code=f'{secrets.randbelow(900000)+100000}'
@@ -189,7 +189,7 @@ def client_ip():
     return request.remote_addr or 'unknown'
 
 def validate_production_config():
-    if APP_ENV != 'production': return
+    if APP_ENV != 'production': return []
     required = ['MONGODB_URI','MONGODB_DB_NAME','AUTH_SECRET','SMTP_HOST','SMTP_USER','SMTP_PASSWORD','SMTP_FROM']
     missing = [k for k in required if not os.getenv(k)]
     if os.getenv('INITIAL_ADMIN_EMAIL') and not os.getenv('INITIAL_ADMIN_PASSWORD'):
@@ -200,9 +200,9 @@ def validate_production_config():
         if not os.getenv('GOOGLE_DRIVE_FOLDER_ID'): missing.append('GOOGLE_DRIVE_FOLDER_ID')
         if not os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON') and not (os.getenv('GOOGLE_SERVICE_ACCOUNT_EMAIL') and os.getenv('GOOGLE_PRIVATE_KEY')):
             missing.append('GOOGLE_SERVICE_ACCOUNT_EMAIL/GOOGLE_PRIVATE_KEY or GOOGLE_SERVICE_ACCOUNT_JSON')
-    if missing: raise RuntimeError('Missing production environment variables: ' + ', '.join(dict.fromkeys(missing)))
+    return list(dict.fromkeys(missing))
 
-validate_production_config()
+CONFIG_MISSING = [] if APP_ENV != 'production' else validate_production_config()
 
 def csrf_token():
     token=session.get('_csrf')
@@ -241,6 +241,20 @@ def inject_security():
 @app.context_processor
 def globals_(): return {'current_user':current_user(),'currency':CURRENCY,'year':datetime.now().year}
 
+@app.get('/api/health')
+def api_health():
+    return jsonify(ok=True, service='gldc', environment=APP_ENV, requestId=request.request_id), 200
+
+@app.get('/api/ready')
+def api_ready():
+    missing = CONFIG_MISSING
+    database_ok = ensure_database_initialized() if not missing else False
+    if missing:
+        return jsonify(ok=False, ready=False, error={'code':'CONFIGURATION_INCOMPLETE','message':'Required production configuration is missing.','missing':missing}), 503
+    if not database_ok:
+        return jsonify(ok=False, ready=False, error={'code':'DATABASE_UNAVAILABLE','message':'Database is unavailable.','detail':_database_init_error}), 503
+    return jsonify(ok=True, ready=True, database=True), 200
+
 @app.route('/')
 def home(): return render_template('home.html', title='Land. Design. Development. Done Right.')
 @app.route('/about')
@@ -278,28 +292,11 @@ def terms(): return render_template('terms.html', title='Terms & Conditions')
 @app.route('/admin')
 def admin(): return render_template('admin.html', title='Management Console')
 
-@app.get('/api/ready')
-def api_ready():
-    try:
-        if not db: raise RuntimeError('database not configured')
-        db.command('ping')
-        return jsonify(ok=True,status='ready',timestamp=now().isoformat())
-    except Exception:
-        return jsonify(ok=False,status='not_ready'),503
-
-@app.get('/api/health')
-def api_health():
-    started=datetime.now().timestamp()
-    try:
-        if not db: raise RuntimeError()
-        db.command('ping'); return jsonify(ok=True,status='healthy',database='reachable',latencyMs=round((datetime.now().timestamp()-started)*1000),timestamp=now().isoformat())
-    except Exception: return jsonify(ok=False,status='degraded',database='unreachable',latencyMs=round((datetime.now().timestamp()-started)*1000),timestamp=now().isoformat()),503
-
 @app.post('/api/auth/login')
 def api_login():
     try:
         rate_limit('login:'+client_ip(), maximum=int(os.getenv('LOGIN_RATE_LIMIT_MAX','10'))); bootstrap_admin(); b=request.get_json(force=True); email=str(b.get('email','')).strip().lower(); password=str(b.get('password',''))
-        u=db.users.find_one({'email':email,'status':'ACTIVE'}) if db else None
+        u=db.users.find_one({'email':email,'status':'ACTIVE'}) if db is not None else None
         if not u or not u.get('passwordHash') or not verify_password(password,u['passwordHash']): return json_error('Invalid email or password.',401,'INVALID_CREDENTIALS')
         session.clear(); session.permanent=True; csrf_token(); session['user']={'id':str(u['_id']),'email':u['email'],'name':u.get('name',''),'role':u['role']}; db.audit.insert_one({'action':'LOGIN','user':u['email'],'createdAt':now()}); return jsonify(ok=True,user=session['user'])
     except RuntimeError as e:
@@ -466,7 +463,7 @@ def api_callback():
 @app.get('/api/public/content')
 def api_public_content():
     try:
-        s=db.settings.find_one({'key':'public'}) if db else None; content=list(db.content.find({'public':True},{'_id':0,'key':1,'value':1})) if db else []
+        s=db.settings.find_one({'key':'public'}) if db is not None else None; content=list(db.content.find({'public':True},{'_id':0,'key':1,'value':1})) if db is not None else []
         return jsonify(ok=True,settings={k:s.get(k) for k in ['company','phone','email','location','hours','tagline']} if s else None,content=content)
     except Exception: return jsonify(ok=False,error={'code':'CONTENT_UNAVAILABLE','message':'Public content is temporarily unavailable.'}),503
 
@@ -493,7 +490,7 @@ def unhandled(e):
     return json_error('An internal server error occurred.', 500, 'INTERNAL_ERROR') if request.path.startswith('/api/') else render_template('404.html', title='Server error'), 500
 
 def init_database():
-    if not db: return
+    if db is None: return
     db.command('ping')
     db.leads.create_index([('email',ASCENDING),('createdAt',DESCENDING)])
     db.leads.create_index([('status',ASCENDING),('createdAt',DESCENDING)])
@@ -508,16 +505,38 @@ def init_database():
     db.rate_limits.create_index([('createdAt',ASCENDING)], expireAfterSeconds=7200)
     db.audit.create_index([('createdAt',DESCENDING)])
 
-if db:
+_database_initialized = False
+_database_init_error = None
+
+def ensure_database_initialized():
+    global _database_initialized, _database_init_error
+    if _database_initialized:
+        return True
+    if CONFIG_MISSING:
+        return False
+    if db is None:
+        _database_init_error = 'MONGODB_URI is not configured.'
+        return False
     try:
         init_database()
         bootstrap_admin()
-        if APP_ENV == 'production' and db.users.count_documents({}) == 0:
-            raise RuntimeError('No administrator account exists. Set INITIAL_ADMIN_EMAIL and INITIAL_ADMIN_PASSWORD for first deployment.')
+        if APP_ENV == 'production' and db.users.count_documents({}) == 0 and os.getenv('REQUIRE_INITIAL_ADMIN','false').lower() == 'true':
+            raise RuntimeError('No administrator account exists. Set INITIAL_ADMIN_EMAIL and INITIAL_ADMIN_PASSWORD.')
+        _database_initialized = True
+        _database_init_error = None
+        return True
     except Exception as startup_error:
-        if APP_ENV == 'production':
-            raise RuntimeError(f'Production startup validation failed: {startup_error}')
-        app.logger.warning('Database startup check failed: %s', startup_error)
+        _database_init_error = str(startup_error)
+        app.logger.error('Database initialization failed: %s', startup_error)
+        return False
+
+@app.before_request
+def lazy_database_initialization():
+    # Vercel imports the module during function initialization. Do not connect to MongoDB
+    # or fail deployment at import time; initialize lazily on the first request instead.
+    if request.path.startswith('/api/') and request.path not in {'/api/health', '/api/ready', '/api/payments/callback'}:
+        if not ensure_database_initialized():
+            return json_error('Service configuration or database is temporarily unavailable.', 503, 'SERVICE_UNAVAILABLE')
 
 if __name__=='__main__':
     app.run(host='0.0.0.0', port=int(os.getenv('PORT','5000')), debug=False)

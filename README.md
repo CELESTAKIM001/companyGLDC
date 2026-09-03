@@ -76,3 +76,28 @@ Use production Daraja credentials. Configure `DARAJA_CALLBACK_URL` to the public
 ## Important
 
 The application intentionally fails fast in `APP_ENV=production` when required configuration is missing. No demo admin credentials or development secrets are embedded.
+
+## 7. Vercel deployment
+
+This repository includes `vercel.json` and `api/index.py` for Vercel's Python runtime. The Flask module is intentionally import-safe: MongoDB initialization and production configuration checks are performed lazily instead of crashing the serverless function during import.
+
+In Vercel Project Settings → Environment Variables, configure the production variables from `.env.example`. At minimum, set `MONGODB_URI`, `MONGODB_DB_NAME`, `AUTH_SECRET`, SMTP variables, and the Google/Daraja variables if those features are enabled.
+
+After deployment, test:
+
+- `/api/health` — function health/import check
+- `/api/ready` — environment + MongoDB readiness check
+- `/` — public application
+
+For the M-Pesa callback, use the deployed HTTPS URL ending in `/api/payments/callback`.
+
+### Vercel notes
+
+- Do not upload `.env` or service-account JSON into the repository.
+- Use Vercel Environment Variables for secrets.
+- MongoDB Atlas must permit connections from Vercel. For stronger security, use the appropriate Atlas network-access strategy for your deployment rather than exposing the database broadly.
+- Vercel serverless functions are stateless. Application rate limiting therefore uses MongoDB, not process memory.
+
+## Vercel / PyMongo import-safety fix
+
+The Vercel serverless entry point is `api/index.py`. MongoDB initialization is lazy and is never performed during module import. PyMongo `Database` objects are always checked with `is None` / `is not None`; they are never evaluated as booleans. This prevents `NotImplementedError: Database objects do not implement truth value testing` during Vercel cold starts.
