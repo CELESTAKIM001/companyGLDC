@@ -128,18 +128,51 @@ def verify_otp(email, code):
 
 
 def google_creds():
-    # Supports either a complete service-account JSON or the env fields from the original app.
-    raw=os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON','').strip()
+    # Accept the common Vercel formats safely: raw service-account JSON,
+    # base64-encoded JSON, or the individual service-account env fields.
+    raw = os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON', '').strip()
+    creds = None
     if raw:
-        return json.loads(raw)
-    key=os.getenv('GOOGLE_PRIVATE_KEY','').replace('\\n','\n')
-    return {'type':'service_account','client_email':os.getenv('GOOGLE_SERVICE_ACCOUNT_EMAIL'),'private_key':key,'token_uri':'https://oauth2.googleapis.com/token'}
+        try:
+            creds = json.loads(raw)
+        except json.JSONDecodeError:
+            try:
+                creds = json.loads(base64.b64decode(raw).decode('utf-8'))
+            except Exception as exc:
+                raise RuntimeError('GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON or base64-encoded JSON.') from exc
+    else:
+        key = os.getenv('GOOGLE_PRIVATE_KEY', '')
+        # Vercel env values may arrive with literal \n characters.
+        key = key.replace('\\n', '\n').strip()
+        creds = {
+            'type': 'service_account',
+            'client_email': os.getenv('GOOGLE_SERVICE_ACCOUNT_EMAIL', '').strip(),
+            'private_key': key,
+            'token_uri': 'https://oauth2.googleapis.com/token'
+        }
+
+    if not isinstance(creds, dict):
+        raise RuntimeError('Google service-account credentials must be a JSON object.')
+
+    # Some deployments paste the private key as a nested object. Google Auth
+    # expects PEM text/bytes, so fail with a useful message instead of the
+    # cryptography error: "a bytes-like object is required, not dict".
+    private_key = creds.get('private_key')
+    if isinstance(private_key, dict):
+        private_key = private_key.get('value') or private_key.get('private_key')
+    if private_key is not None:
+        if not isinstance(private_key, str):
+            raise RuntimeError('Google private key must be PEM text, not an object.')
+        creds['private_key'] = private_key.replace('\\n', '\n').strip()
+    if not creds.get('client_email') or not creds.get('private_key'):
+        raise RuntimeError('Google service-account email/private key is not configured.')
+    return creds
 
 
 def google_service(service, scopes):
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
-    creds=service_account.Credentials.from_service_account_info(google_creds(), scopes=scopes)
+    creds = service_account.Credentials.from_service_account_info(google_creds(), scopes=scopes)
     return build(service, 'v3', credentials=creds, cache_discovery=False)
 
 
