@@ -2,6 +2,10 @@ import os, re, json, base64, hashlib, secrets, smtplib, time
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from email.message import EmailMessage
+from io import BytesIO
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm
+from reportlab.pdfgen import canvas
 
 import requests
 import bcrypt
@@ -93,13 +97,16 @@ def bootstrap_admin():
         db.users.update_one({'email':email},{'$setOnInsert':{'email':email,'name':'GLDC Administrator','passwordHash':hash_password(password),'role':'SUPER ADMIN / OWNER','status':'ACTIVE','createdAt':now(),'updatedAt':now()}},upsert=True)
 
 
-def send_email(to, subject, text, html=None):
+def send_email(to, subject, text, html=None, attachments=None):
     host=os.getenv('SMTP_HOST'); user=os.getenv('SMTP_USER'); password=os.getenv('SMTP_PASSWORD')
     if not host: raise RuntimeError('SMTP_NOT_CONFIGURED')
     msg=EmailMessage(); msg['From']=os.getenv('SMTP_FROM', user); msg['To']=to; msg['Subject']=subject
     if os.getenv('SMTP_REPLY_TO'): msg['Reply-To']=os.getenv('SMTP_REPLY_TO')
     msg.set_content(text)
     if html: msg.add_alternative(html, subtype='html')
+    for filename, data, mimetype in attachments or []:
+        maintype, subtype = mimetype.split('/', 1)
+        msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=filename)
     port=int(os.getenv('SMTP_PORT','587')); secure=os.getenv('SMTP_SECURE','false').lower()=='true'
     if secure:
         with smtplib.SMTP_SSL(host,port) as s: s.login(user,password); s.send_message(msg)
@@ -107,6 +114,33 @@ def send_email(to, subject, text, html=None):
         with smtplib.SMTP(host,port) as s:
             s.ehlo(); s.starttls(); s.ehlo(); s.login(user,password); s.send_message(msg)
 
+
+def build_invoice_pdf(invoice):
+    buf=BytesIO(); c=canvas.Canvas(buf, pagesize=A4); w,h=A4
+    company=os.getenv('COMPANY_NAME','Gavin Land & Design Consultants')
+    contact=' • '.join(x for x in [os.getenv('SMTP_FROM',''), os.getenv('COMPANY_PHONE','')] if x)
+    c.setTitle(invoice['invoiceNumber'])
+    c.setFont('Helvetica-Bold',20); c.drawString(25*mm,h-30*mm,company)
+    c.setFont('Helvetica',9); c.drawString(25*mm,h-37*mm,'Land • Design • Development • Project Consultancy')
+    c.setFont('Helvetica-Bold',16); c.drawRightString(w-25*mm,h-30*mm,'INVOICE')
+    c.setFont('Helvetica',9); c.drawRightString(w-25*mm,h-37*mm,invoice['invoiceNumber'])
+    y=h-60*mm
+    c.setFont('Helvetica-Bold',10); c.drawString(25*mm,y,'BILL TO')
+    c.setFont('Helvetica',10); c.drawString(25*mm,y-7*mm,invoice.get('recipientName') or invoice['recipientEmail'])
+    c.drawString(25*mm,y-14*mm,invoice['recipientEmail'])
+    c.setFont('Helvetica-Bold',10); c.drawRightString(w-25*mm,y,'ISSUED')
+    c.setFont('Helvetica',10); c.drawRightString(w-25*mm,y-7*mm,str(invoice.get('issuedAt',''))[:10])
+    c.setFont('Helvetica-Bold',10); c.drawRightString(w-25*mm,y-14*mm,'DUE')
+    c.setFont('Helvetica',10); c.drawRightString(w-25*mm,y-21*mm,invoice.get('dueDate') or 'On receipt')
+    y-=38*mm
+    c.setFont('Helvetica-Bold',10); c.drawString(25*mm,y,'DESCRIPTION'); c.drawRightString(w-25*mm,y,'AMOUNT')
+    c.line(25*mm,y-3*mm,w-25*mm,y-3*mm)
+    c.setFont('Helvetica',10); c.drawString(25*mm,y-12*mm,invoice['description'][:90]); c.drawRightString(w-25*mm,y-12*mm,f"KES {float(invoice['amount']):,.2f}")
+    c.line(25*mm,y-20*mm,w-25*mm,y-20*mm)
+    c.setFont('Helvetica-Bold',12); c.drawRightString(w-25*mm,y-32*mm,f"TOTAL DUE: KES {float(invoice['amount']):,.2f}")
+    c.setFont('Helvetica',9); c.drawString(25*mm,25*mm,'Thank you for choosing GLDC.')
+    if contact: c.drawRightString(w-25*mm,25*mm,contact)
+    c.save(); return buf.getvalue()
 
 def request_otp(email):
     if db is None: raise RuntimeError('DATABASE_UNAVAILABLE')
@@ -118,13 +152,53 @@ def request_otp(email):
 
 
 def verify_otp(email, code):
-    email=email.lower().strip(); x=db.otps.find_one({'email':email}, sort=[('createdAt',DESCENDING)])
-    max_attempts=int(os.getenv('OTP_MAX_ATTEMPTS','5'))
-    if not x or x['expiresAt'] < now(): raise RuntimeError('OTP_EXPIRED')
-    if x.get('attempts',0)>=max_attempts: raise RuntimeError('OTP_LOCKED')
-    if x['codeHash'] != hashlib.sha256(code.strip().encode()).hexdigest():
-        db.otps.update_one({'_id':x['_id']},{'$inc':{'attempts':1}}); raise RuntimeError('OTP_INVALID')
-    db.otps.delete_many({'email':email}); return True
+    if db is None:
+        raise RuntimeError('DATABASE_UNAVAILABLE')
+    email = str(email or '').strip().lower()
+    code = str(code or '').strip()
+    if not email or '@' not in email:
+        raise RuntimeError('OTP_INVALID')
+    if not re.fullmatch(r'\d{6}', code):
+        raise RuntimeError('OTP_INVALID')
+
+    max_attempts = int(os.getenv('OTP_MAX_ATTEMPTS', '5'))
+    try:
+        x = db.otps.find_one({'email': email}, sort=[('createdAt', DESCENDING)])
+    except Exception as exc:
+        app.logger.exception('OTP lookup failed request=%s email=%s', getattr(request, 'request_id', 'unknown'), email)
+        raise RuntimeError('DATABASE_UNAVAILABLE') from exc
+
+    if not x:
+        raise RuntimeError('OTP_EXPIRED')
+
+    # Be defensive with records created by older versions of the application.
+    expires_at = x.get('expiresAt')
+    if not isinstance(expires_at, datetime) or expires_at < now():
+        raise RuntimeError('OTP_EXPIRED')
+
+    attempts = x.get('attempts', 0)
+    try:
+        attempts = int(attempts)
+    except (TypeError, ValueError):
+        attempts = 0
+    if attempts >= max_attempts:
+        raise RuntimeError('OTP_LOCKED')
+
+    stored_hash = x.get('codeHash')
+    expected_hash = hashlib.sha256(code.encode('utf-8')).hexdigest()
+    if not isinstance(stored_hash, str) or not secrets.compare_digest(stored_hash, expected_hash):
+        try:
+            db.otps.update_one({'_id': x['_id']}, {'$inc': {'attempts': 1}})
+        except Exception:
+            app.logger.exception('OTP attempt update failed request=%s email=%s', getattr(request, 'request_id', 'unknown'), email)
+        raise RuntimeError('OTP_INVALID')
+
+    try:
+        db.otps.delete_many({'email': email})
+    except Exception as exc:
+        app.logger.exception('OTP cleanup failed request=%s email=%s', getattr(request, 'request_id', 'unknown'), email)
+        raise RuntimeError('DATABASE_UNAVAILABLE') from exc
+    return True
 
 
 def google_creds():
@@ -514,11 +588,27 @@ def api_request_otp():
 
 @app.post('/api/auth/verify-otp')
 def api_verify_otp():
-    b=request.get_json(force=True) or {}; email=str(b.get('email','')).strip().lower(); code=str(b.get('code','')).strip()
-    try: verify_otp(email,code); return jsonify(ok=True,verified=True)
+    request_id = getattr(request, 'request_id', secrets.token_hex(12))
+    try:
+        b = request.get_json(silent=True) or {}
+        email = str(b.get('email', '')).strip().lower()
+        code = str(b.get('code', '')).strip()
+        if not email or '@' not in email or not re.fullmatch(r'\d{6}', code):
+            return json_error('Enter a valid email address and 6-digit verification code.', 422, 'VALIDATION_ERROR')
+
+        verify_otp(email, code)
+        return jsonify(ok=True, verified=True, message='Email verified successfully.', requestId=request_id), 200
     except RuntimeError as e:
-        if str(e) in ['OTP_EXPIRED','OTP_LOCKED','OTP_INVALID']: return json_error('The verification code is invalid or expired.',400,str(e))
-        return json_error(str(e),500)
+        reason = str(e)
+        if reason in {'OTP_EXPIRED', 'OTP_LOCKED', 'OTP_INVALID'}:
+            return json_error('The verification code is invalid or expired.', 400, reason)
+        if reason == 'DATABASE_UNAVAILABLE':
+            return jsonify(ok=False, error={'code':'DATABASE_UNAVAILABLE','message':'Verification service is temporarily unavailable. Please try again.','requestId':request_id}), 503
+        app.logger.exception('OTP verification runtime failure request=%s email=%s', request_id, email)
+        return jsonify(ok=False, error={'code':'OTP_VERIFY_FAILED','message':'Unable to verify the code right now.','requestId':request_id}), 500
+    except Exception as exc:
+        app.logger.exception('OTP verification unexpected failure request=%s email=%s', request_id, email if 'email' in locals() else '')
+        return jsonify(ok=False, error={'code':'OTP_VERIFY_FAILED','message':'Unable to verify the code right now.','requestId':request_id}), 500
 
 @app.post('/api/leads')
 def api_leads():
@@ -689,6 +779,68 @@ def api_content_save():
     if not key or len(key)>160: return json_error('Invalid key',422,'VALIDATION_ERROR')
     db.content.update_one({'key':key},{'$set':{'key':key,'value':value,'updatedAt':now()}},upsert=True); return jsonify(ok=True)
 
+@app.get('/api/admin/invoices')
+@admin_required
+def api_admin_invoices():
+    try:
+        return jsonify(ok=True, invoices=list(db.invoices.find({}, {'_id':0}).sort('createdAt', DESCENDING).limit(200)))
+    except Exception:
+        app.logger.exception('Invoice listing failed request=%s', request.request_id)
+        return json_error('Unable to load invoices.',500,'INVOICE_LIST_FAILED')
+
+@app.post('/api/admin/invoices')
+@admin_required
+def api_admin_create_invoice():
+    try:
+        b=request.get_json(silent=True) or {}; lead_id=str(b.get('leadId','')).strip()
+        recipient_email=str(b.get('recipientEmail','')).strip().lower(); recipient_name=str(b.get('recipientName','')).strip()
+        description=str(b.get('description','')).strip(); due_date=str(b.get('dueDate','')).strip()[:30]
+        try: amount=float(b.get('amount',0))
+        except (TypeError,ValueError): amount=0
+        if lead_id:
+            lead=db.leads.find_one({'id':lead_id},{'_id':0})
+            if not lead: return json_error('Lead not found.',404,'LEAD_NOT_FOUND')
+            recipient_email=str(lead.get('email') or recipient_email).strip().lower(); recipient_name=recipient_name or str(lead.get('name',''))
+        if '@' not in recipient_email or amount<=0 or not description: return json_error('Recipient email, positive amount and description are required.',422,'VALIDATION_ERROR')
+        invoice_number='GLDC-INV-'+datetime.now(timezone.utc).strftime('%Y%m%d')+'-'+secrets.token_hex(3).upper()
+        inv={'invoiceNumber':invoice_number,'leadId':lead_id or None,'recipientEmail':recipient_email,'recipientName':recipient_name,'description':description,'amount':round(amount,2),'currency':'KES','dueDate':due_date,'status':'CREATED','issuedAt':now().isoformat(),'createdAt':now(),'createdBy':current_user().get('email'),'sentAt':None}
+        db.invoices.insert_one(inv)
+        send_now=bool(b.get('send',True))
+        if send_now:
+            pdf=build_invoice_pdf(inv); subject=f'GLDC Invoice {invoice_number}'
+            text=f'Dear {recipient_name or recipient_email},\n\nPlease find attached your GLDC invoice {invoice_number} for KES {amount:,.2f}.\n\nDescription: {description}\nDue: {due_date or "On receipt"}\n\nRegards,\nGavin Land & Design Consultants'
+            html=f'<p>Dear {recipient_name or recipient_email},</p><p>Please find attached your <strong>GLDC invoice {invoice_number}</strong> for <strong>KES {amount:,.2f}</strong>.</p><p><strong>Description:</strong> {description}<br><strong>Due:</strong> {due_date or "On receipt"}</p><p>Regards,<br>Gavin Land &amp; Design Consultants</p>'
+            send_email(recipient_email,subject,text,html,[('GLDC-'+invoice_number+'.pdf',pdf,'application/pdf')])
+            db.invoices.update_one({'invoiceNumber':invoice_number},{'$set':{'status':'SENT','sentAt':now()}})
+        return jsonify(ok=True, invoice={'invoiceNumber':invoice_number,'recipientEmail':recipient_email,'recipientName':recipient_name,'amount':round(amount,2),'description':description,'dueDate':due_date,'status':'SENT' if send_now else 'CREATED'})
+    except Exception:
+        app.logger.exception('Invoice creation/send failed request=%s', request.request_id)
+        return json_error('Unable to create or send invoice.',500,'INVOICE_CREATE_FAILED')
+
+@app.get('/api/admin/invoices/<invoice_number>/download')
+@admin_required
+def api_admin_invoice_download(invoice_number):
+    try:
+        inv=db.invoices.find_one({'invoiceNumber':invoice_number},{'_id':0})
+        if not inv: return json_error('Invoice not found.',404,'INVOICE_NOT_FOUND')
+        pdf=build_invoice_pdf(inv); resp=Response(pdf,status=200,mimetype='application/pdf')
+        resp.headers['Content-Disposition']=f'attachment; filename="{invoice_number}.pdf"'; resp.headers['Content-Length']=str(len(pdf)); resp.headers['Cache-Control']='private, no-store'
+        return resp
+    except Exception:
+        app.logger.exception('Invoice download failed request=%s', request.request_id); return json_error('Unable to download invoice.',500,'INVOICE_DOWNLOAD_FAILED')
+
+@app.post('/api/admin/invoices/<invoice_number>/resend')
+@admin_required
+def api_admin_invoice_resend(invoice_number):
+    try:
+        inv=db.invoices.find_one({'invoiceNumber':invoice_number},{'_id':0})
+        if not inv: return json_error('Invoice not found.',404,'INVOICE_NOT_FOUND')
+        pdf=build_invoice_pdf(inv); send_email(inv['recipientEmail'],f"GLDC Invoice {invoice_number}",f"Please find attached your GLDC invoice {invoice_number}.",f"<p>Please find attached your <strong>GLDC invoice {invoice_number}</strong>.</p>",[('GLDC-'+invoice_number+'.pdf',pdf,'application/pdf')])
+        db.invoices.update_one({'invoiceNumber':invoice_number},{'$set':{'status':'SENT','sentAt':now()}})
+        return jsonify(ok=True,message='Invoice sent.',invoiceNumber=invoice_number)
+    except Exception:
+        app.logger.exception('Invoice resend failed request=%s', request.request_id); return json_error('Unable to resend invoice.',500,'INVOICE_SEND_FAILED')
+
 @app.post('/api/payments/stk')
 @login_required
 def api_stk():
@@ -757,6 +909,8 @@ def init_database():
     db.members.create_index([('email',ASCENDING)], unique=True)
     db.users.create_index([('email',ASCENDING)], unique=True)
     db.payments.create_index([('checkoutRequestId',ASCENDING)], unique=True, sparse=True)
+    db.invoices.create_index([('invoiceNumber',ASCENDING)], unique=True)
+    db.invoices.create_index([('recipientEmail',ASCENDING),('createdAt',DESCENDING)])
     db.payments.create_index([('status',ASCENDING),('createdAt',DESCENDING)])
     db.content.create_index([('key',ASCENDING)], unique=True)
     db.settings.create_index([('key',ASCENDING)], unique=True)
