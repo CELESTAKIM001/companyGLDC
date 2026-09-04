@@ -675,7 +675,7 @@ def security_headers(response):
     response.headers.setdefault('Referrer-Policy','strict-origin-when-cross-origin')
     response.headers.setdefault('Permissions-Policy','camera=(), microphone=(), geolocation=()')
     response.headers.setdefault('Cross-Origin-Opener-Policy','same-origin')
-    response.headers.setdefault('Content-Security-Policy', "default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self' 'unsafe-inline' https://unpkg.com; connect-src 'self' https://nominatim.openstreetmap.org; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
+    response.headers.setdefault('Content-Security-Policy', "default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://unpkg.com; font-src 'self' https://fonts.gstatic.com; script-src 'self' 'unsafe-inline' https://unpkg.com; connect-src 'self' https://nominatim.openstreetmap.org https://unpkg.com; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
     if request.is_secure or app.config['SESSION_COOKIE_SECURE']:
         response.headers.setdefault('Strict-Transport-Security','max-age=31536000; includeSubDomains')
     return response
@@ -751,7 +751,7 @@ def contact(): return render_template('contact.html', title='Contact')
 @app.route('/quote')
 def quote(): return render_template('quote.html', title='Request a Quote')
 @app.route('/member')
-def member(): return redirect('/membership')
+def member(): return render_template('member.html', title='Become a GLDC Member')
 @app.route('/verify')
 def verify_page(): return render_template('verify.html', title='Verification')
 @app.route('/document')
