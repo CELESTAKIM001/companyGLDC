@@ -4,15 +4,15 @@
   <a href="/members" class="pp-back">← MEMBER DIRECTORY</a>
   <div class="pp-identity">
     <div class="pp-avatar-wrap">{% if member.photoDriveId %}<img class="pp-avatar" src="{{ '/api/members/photo/' + member.id }}" alt="{{ member.name }}">{% else %}<div class="pp-avatar pp-initial">{{ member.name[:1]|upper }}</div>{% endif %}</div>
-    <div><span class="pp-kicker">VERIFIED GLDC MEMBER · VIEW ONLY</span><h1>{{ member.name }}</h1><p>{{ member.profession or 'GLDC Member' }}{% if member.company %} · {{ member.company }}{% endif %}</p><div class="pp-tags"><span>✓ APPROVED MEMBER</span>{% if member.location %}<span>⌖ {{ member.location }}</span>{% endif %}</div></div>
+    <div><span class="pp-kicker">VERIFIED GLDC MEMBER</span><h1>{{ member.name }}</h1><p>{{ member.profession or 'GLDC Member' }}{% if member.company %} · {{ member.company }}{% endif %}</p><div class="pp-tags"><span>✓ APPROVED MEMBER</span>{% if member.location %}<span>⌖ {{ member.location }}</span>{% endif %}</div></div>
   </div>
 </div></section>
 <section class="section"><div class="container pp-layout">
   <main class="pp-main">
-    <div class="pp-card"><span class="pp-label">PROFESSIONAL PROFILE</span><h2>About {{ member.name.split(' ')[0] }}</h2><p class="pp-bio">{{ member.bio or 'This member has not added a public biography yet.' }}</p>{% if member.portfolioUrl %}<a class="btn secondary" href="{{ member.portfolioUrl }}" target="_blank" rel="noopener noreferrer">VIEW PROFESSIONAL WORK ↗</a>{% endif %}</div>
-    <div class="pp-card"><span class="pp-label">MEMBERSHIP</span><h2>GLDC credentials</h2><div class="pp-grid"><div><label>Membership number</label><strong>{{ member.membershipNumber or 'Verified member' }}</strong></div><div><label>Professional field</label><strong>{{ member.profession or 'GLDC Member' }}</strong></div><div><label>Organisation</label><strong>{{ member.company or 'Independent professional' }}</strong></div><div><label>Location</label><strong>{{ member.location or 'Kenya' }}</strong></div><div><label>Profile access</label><strong>Public view only</strong></div></div></div>
+    <div class="pp-card"><span class="pp-label">PROFESSIONAL PROFILE</span><h2>About {{ member.name.split(' ')[0] }}</h2><p class="pp-bio">{{ member.bio or 'This member has not added a public biography yet.' }}</p></div>
+    <div class="pp-card"><span class="pp-label">MEMBERSHIP</span><h2>GLDC credentials</h2><div class="pp-grid"><div><label>Membership number</label><strong>{{ member.membershipNumber or 'Verified member' }}</strong></div><div><label>Professional field</label><strong>{{ member.profession or 'GLDC Member' }}</strong></div><div><label>Organisation</label><strong>{{ member.company or 'Independent professional' }}</strong></div><div><label>Location</label><strong>{{ member.location or 'Kenya' }}</strong></div></div></div>
   </main>
-  <aside class="pp-side"><div class="pp-card pp-connect"><span class="pp-label">GLDC COMMUNITY</span><h2>Connect through GLDC</h2><p>Members can view approved professional profiles without editing them. Private account details remain protected.</p><a class="btn primary" href="/members">EXPLORE MEMBERS</a><a class="btn secondary" href="/member/login">MEMBER PORTAL</a></div></aside>
+  <aside class="pp-side"><div class="pp-card pp-connect"><span class="pp-label">GLDC COMMUNITY</span><h2>Connect through GLDC</h2><p>Explore other approved professionals and return to your secure member workspace.</p><a class="btn primary" href="/members">EXPLORE MEMBERS</a><a class="btn secondary" href="/member/login">MEMBER PORTAL</a></div></aside>
 </div></section>
 {% endblock %}
 {% block scripts %}<style>
