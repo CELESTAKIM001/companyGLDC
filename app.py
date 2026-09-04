@@ -1185,14 +1185,34 @@ def api_ready():
 
 @app.route('/')
 def home(): return render_template('home.html', title='Land. Design. Development. Done Right.')
+def public_cms_page(key, default):
+    return site_content_json(key, default)
+
 @app.route('/about')
-def about(): return render_template('about.html', title='About GLDC')
+def about():
+    default={'eyebrow':'ABOUT GLDC','title':'Professional expertise built around development.','intro':'GLDC connects land, design, planning and project consultancy through one practical workflow.','sections':[
+        {'eyebrow':'OUR APPROACH','title':'Clear, practical, accountable.','text':'We focus on responsible documentation, transparent communication, coordinated project delivery and advice that can be acted on.','images':[],'effect':'hover'},
+        {'eyebrow':'MISSION','title':'Move projects forward.','text':'Our consultancy workflow is designed to reduce uncertainty from early land and planning decisions through design and development.','images':[],'effect':'slide'}]}
+    return render_template('about.html', title='About GLDC', page=public_cms_page('about.page',default))
 @app.route('/services')
-def services(): return render_template('services.html', title='Services')
+def services():
+    default={'eyebrow':'SERVICES','title':'Services designed for real project progress.','intro':'Explore the consultancy services available through GLDC.','backgroundImages':[],'backgroundEffect':'slide','items':[
+        {'category':'CONSULTANCY','title':'Land Development Consultancy','text':'Land-use planning, site analysis and development feasibility.','href':'/quote','cta':'Start an enquiry →','images':[],'effect':'hover'},
+        {'category':'CONSULTANCY','title':'Architectural Design','text':'Architectural concepts, plans, drawings and visualization.','href':'/quote','cta':'Start an enquiry →','images':[],'effect':'slide'},
+        {'category':'CONSULTANCY','title':'Planning & Approvals','text':'Planning applications, approvals and regulatory support.','href':'/quote','cta':'Start an enquiry →','images':[],'effect':'zoom'},
+        {'category':'CONSULTANCY','title':'Project Consultancy','text':'Project planning, coordination and monitoring.','href':'/quote','cta':'Start an enquiry →','images':[],'effect':'hover'}]}
+    return render_template('services.html', title='Services', page=public_cms_page('services.page',default))
 @app.route('/service-detail')
 def service_detail(): return render_template('service_detail.html', title='Consultancy Service')
 @app.route('/projects')
-def projects(): return render_template('projects.html', title='Projects')
+def projects():
+    default={'eyebrow':'PROJECTS','title':'Selected project stories.','intro':'Approved GLDC work can be displayed here after publication review.','privacy':'Portfolio privacy: client and project information is never exposed publicly until approved through the administration workflow.','backgroundImages':[],'backgroundEffect':'slide'}
+    rows=[]
+    if db is not None:
+        try:
+            rows=[clean_doc(x) for x in db.site_projects.find({'status':'PUBLISHED'}).sort('publishedAt',DESCENDING).limit(100)]
+        except Exception: pass
+    return render_template('projects.html', title='Projects', page=public_cms_page('projects.page',default), projects=rows)
 @app.route('/project-detail')
 def project_detail(): return render_template('project_detail.html', title='Project Details')
 @app.route('/team')
@@ -1224,9 +1244,14 @@ def insights():
                 if post.get('imageCode'):
                     post['imageUrl']=f"/api/public/site-image/{post.get('imageCode')}"
         except Exception: pass
-    return render_template('insights.html', title='Insights & Resources', posts=posts)
+    default={'eyebrow':'GLDC INSIGHTS','title':'Insights & Resources','intro':'Practical perspectives on land, development, planning and project delivery.','backgroundImages':[],'backgroundEffect':'slide','emptyTitle':'Insights are being prepared','emptyText':'Published resources will appear here when content managers publish them through the CMS.'}
+    return render_template('insights.html', title='Insights & Resources', posts=posts, page=public_cms_page('insights.page',default))
 @app.route('/consultation')
 def consultation(): return render_template('consultation.html', title='Request a Consultation')
+@app.route('/subscribe')
+def subscribe_page(): return render_template('subscribe.html', title='Subscribe to GLDC')
+@app.route('/message')
+def message_page(): return render_template('message.html', title='Send a Message')
 @app.route('/privacy')
 def privacy(): return render_template('privacy.html', title='Privacy Policy')
 @app.route('/terms')
@@ -3023,7 +3048,7 @@ def api_admin_insights_save():
         return json_error('Insight title and content are required.',422,'VALIDATION_ERROR')
     if image_code and not image_code.startswith('IMG-'):
         return json_error('Image code must be a GLDC Drive image code such as IMG-XXXXXXXXXX.',422,'VALIDATION_ERROR')
-    doc={'title':title,'category':category,'excerpt':excerpt,'content':content,'status':status,'imageCode':image_code,'updatedAt':now(),'updatedBy':current_user().get('email')}
+    external_link=str(b.get('externalLink','')).strip(); doc={'title':title,'category':category,'excerpt':excerpt,'content':content,'status':status,'imageCode':image_code,'externalLink':external_link,'updatedAt':now(),'updatedBy':current_user().get('email')}
     if status=='PUBLISHED' and (not post_id or not db.posts.find_one({'id':post_id})):
         doc['publishedAt']=now()
     if post_id:
@@ -3043,6 +3068,74 @@ def api_admin_insight_delete(post_id):
     audit('INSIGHT_DELETED','post',post_id)
     return jsonify(ok=True)
 
+
+@app.get('/api/admin/site-pages')
+@admin_required
+def admin_site_pages():
+    keys=['about.page','services.page','projects.page','insights.page']
+    out={}
+    for key in keys:
+        row=db.content.find_one({'key':key},{'_id':0,'value':1}) or {}
+        try: out[key]=json.loads(row.get('value','')) if row.get('value') else None
+        except Exception: out[key]=None
+    return jsonify(ok=True,pages=out)
+
+@app.post('/api/admin/site-pages/<page_name>')
+@admin_required
+def admin_site_page_save(page_name):
+    keys={'about':'about.page','services':'services.page','projects':'projects.page','insights':'insights.page'}
+    key=keys.get(str(page_name).strip().lower())
+    if not key: return json_error('Unsupported public page.',404,'PAGE_NOT_FOUND')
+    b=request.get_json(silent=True) or {}
+    value=b.get('value')
+    if not isinstance(value,dict): return json_error('Page content must be an object.',422,'VALIDATION_ERROR')
+    db.content.update_one({'key':key},{'$set':{'key':key,'value':json.dumps(value,ensure_ascii=False),'public':True,'updatedAt':now(),'updatedBy':current_user().get('email')}},upsert=True)
+    audit('PUBLIC_PAGE_UPDATED','content',key,{'page':page_name})
+    return jsonify(ok=True,key=key)
+
+@app.get('/api/admin/submissions')
+@admin_required
+def admin_submissions():
+    subs=[clean_doc(x) for x in db.subscribers.find({}).sort('createdAt',DESCENDING).limit(500)] if db is not None else []
+    msgs=[clean_doc(x) for x in db.messages.find({}).sort('createdAt',DESCENDING).limit(500)] if db is not None else []
+    return jsonify(ok=True,subscribers=subs,messages=msgs)
+
+@app.post('/api/subscribe')
+def public_subscribe():
+    b=request.get_json(silent=True) or {}; email=str(b.get('email','')).strip().lower(); name=str(b.get('name','')).strip()
+    if '@' not in email or '.' not in email.split('@')[-1]: return json_error('Enter a valid email address.',422,'VALIDATION_ERROR')
+    if db is None: return json_error('Subscription service is temporarily unavailable. Please try again.',503,'DATABASE_UNAVAILABLE')
+    db.subscribers.update_one({'email':email},{'$set':{'email':email,'name':name,'status':'ACTIVE','updatedAt':now()},'$setOnInsert':{'createdAt':now()}},upsert=True)
+    return jsonify(ok=True,message='Subscription received.')
+
+@app.post('/api/message-request')
+def public_message_request():
+    b=request.get_json(silent=True) or {}; name=str(b.get('name','')).strip(); email=str(b.get('email','')).strip().lower(); message=str(b.get('message','')).strip()
+    if not name or '@' not in email or not message: return json_error('Name, valid email and message are required.',422,'VALIDATION_ERROR')
+    if db is None: return json_error('Message service is temporarily unavailable. Please try again.',503,'DATABASE_UNAVAILABLE')
+    mid=make_id('MSG'); db.messages.insert_one({'id':mid,'name':name,'email':email,'phone':str(b.get('phone','')).strip(),'subject':str(b.get('subject','')).strip(),'message':message,'status':'NEW','createdAt':now(),'updatedAt':now()})
+    db.leads.insert_one({'id':make_id('LED'),'name':name,'email':email,'phone':str(b.get('phone','')).strip(),'service':'GENERAL MESSAGE','message':message,'status':'NEW','source':'WEBSITE_MESSAGE','createdAt':now(),'updatedAt':now()})
+    audit('WEBSITE_MESSAGE_RECEIVED','message',mid)
+    return jsonify(ok=True,message='Message received. GLDC will get back to you.')
+
+
+@app.get('/api/admin/public-projects')
+@admin_required
+def admin_public_projects(): return jsonify(ok=True,projects=list_collection('site_projects',500))
+
+@app.post('/api/admin/public-projects')
+@admin_required
+def admin_public_project_save():
+    b=request.get_json(silent=True) or {}; pid=str(b.get('id','')).strip(); name=str(b.get('name') or b.get('title') or '').strip()
+    if not name: return json_error('Project title is required.',422,'VALIDATION_ERROR')
+    gallery=[str(x).strip().upper() for x in (b.get('gallery') or []) if str(x).strip().upper().startswith('IMG-')]
+    doc={'name':name,'title':name,'category':str(b.get('category','LAND')).strip(),'description':str(b.get('description','')).strip(),'location':str(b.get('location','')).strip(),'status':str(b.get('status','DRAFT')).upper(),'gallery':gallery,'coverImageCode':gallery[0] if gallery else '','updatedAt':now(),'updatedBy':current_user().get('email')}
+    if pid: db.site_projects.update_one({'id':pid},{'$set':doc}); audit('PUBLIC_PROJECT_UPDATED','site_project',pid); return jsonify(ok=True,id=pid)
+    pid=make_id('SPJ'); doc.update({'id':pid,'createdAt':now(),'publishedAt':now() if doc['status']=='PUBLISHED' else None}); db.site_projects.insert_one(doc); audit('PUBLIC_PROJECT_CREATED','site_project',pid); return jsonify(ok=True,id=pid)
+
+@app.delete('/api/admin/public-projects/<pid>')
+@admin_required
+def admin_public_project_delete(pid): db.site_projects.delete_one({'id':pid}); audit('PUBLIC_PROJECT_DELETED','site_project',pid); return jsonify(ok=True)
 
 @app.get('/api/public/site-image/<code>')
 def public_site_image(code):
@@ -3095,7 +3188,7 @@ def admin_media_save():
 @app.patch('/api/admin/media/<media_id>')
 @admin_required
 def admin_media_update(media_id):
-    b=request.get_json(silent=True) or {}; allowed=['slot','name','driveFileId','status','alt','position']; u={k:b[k] for k in allowed if k in b}; u['updatedAt']=now(); db.media.update_one({'id':media_id},{'$set':u}); audit('MEDIA_UPDATED','media',media_id,u); return jsonify(ok=True)
+    b=request.get_json(silent=True) or {}; allowed=['slot','name','driveFileId','status','alt','position','effect']; u={k:b[k] for k in allowed if k in b}; u['updatedAt']=now(); db.media.update_one({'id':media_id},{'$set':u}); audit('MEDIA_UPDATED','media',media_id,u); return jsonify(ok=True)
 
 @app.get('/api/admin/whatsapp')
 @admin_required
