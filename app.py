@@ -444,14 +444,31 @@ def drive_files(minimum=40, max_files=200):
 
 
 def drive_upload_bytes(filename, data, mimetype, folder=None):
-    if not env_bool('GOOGLE_DRIVE_ENABLED', default=True): raise RuntimeError('GOOGLE_DRIVE_DISABLED')
+    if not env_bool('GOOGLE_DRIVE_ENABLED', default=True):
+        raise RuntimeError('GOOGLE_DRIVE_DISABLED')
     from googleapiclient.http import MediaIoBaseUpload
+    from googleapiclient.errors import HttpError
     d=google_service('drive',['https://www.googleapis.com/auth/drive'])
     parent=folder or os.getenv('GOOGLE_DRIVE_FOLDER_ID','')
-    if not parent: raise RuntimeError('GOOGLE_DRIVE_FOLDER_NOT_CONFIGURED')
+    if not parent:
+        raise RuntimeError('GOOGLE_DRIVE_FOLDER_NOT_CONFIGURED')
     media=MediaIoBaseUpload(BytesIO(data),mimetype=mimetype,resumable=False)
     meta={'name':filename,'parents':[parent]}
-    return d.files().create(body=meta,media_body=media,fields='id,name,mimeType,size,webViewLink,webContentLink',supportsAllDrives=True).execute()
+    try:
+        return d.files().create(body=meta,media_body=media,
+            fields='id,name,mimeType,size,webViewLink,webContentLink',
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True).execute()
+    except HttpError as exc:
+        status=getattr(exc.resp,'status',None)
+        raw=getattr(exc,'content',b'')
+        try:
+            detail=json.loads(raw.decode('utf-8','ignore')).get('error',{}).get('message','')
+        except Exception:
+            detail=''
+        if status in (403,404):
+            raise RuntimeError('GOOGLE_DRIVE_FOLDER_ACCESS_DENIED: The configured Google Drive folder is not writable by the service account. Share the folder with the Google service-account email as Editor/Content manager, or set the correct GOOGLE_DRIVE_FOLDER_ID.') from exc
+        raise RuntimeError(f'GOOGLE_DRIVE_UPLOAD_FAILED: {detail or str(exc)}') from exc
 
 def drive_download_bytes_by_id(file_id):
     meta=drive_metadata(file_id)[2]
@@ -1434,7 +1451,12 @@ def membership_document_upload():
     category=str(request.form.get('category','SUPPORTING DOCUMENT')).upper()
     if category=='PASSPORT PHOTO' and ext not in {'jpg','jpeg','png','webp'}: return json_error('Passport photo must be an image.',422,'FILE_TYPE_NOT_ALLOWED')
     try: drive=drive_upload_bytes(f"{m['id']}-{category.replace(' ','-')}-{f.filename}",data,mt)
-    except Exception as e: app.logger.exception('Member Drive upload failed'); return json_error('Unable to store the file in Google Drive.',503,'DRIVE_UPLOAD_FAILED')
+    except Exception as e:
+        app.logger.exception('Member Drive upload failed')
+        msg=str(e)
+        if 'GOOGLE_DRIVE_FOLDER_ACCESS_DENIED' in msg:
+            return json_error('Your file is ready, but GLDC storage is temporarily unavailable because the configured Google Drive folder is not writable. Please try again later or contact GLDC support.',503,'DRIVE_UPLOAD_FAILED')
+        return json_error('Your file could not be stored securely right now. Please try again.',503,'DRIVE_UPLOAD_FAILED')
     rec={'id':make_id('MDOC'),'memberId':m['id'],'category':category,'name':f.filename,'driveFileId':drive.get('id'),'mimeType':mt,'size':len(data),'createdAt':now(),'createdBy':m['email']}
     db.member_documents.insert_one(rec)
     if category=='PASSPORT PHOTO': db.members.update_one({'_id':m['_id']},{'$set':{'photoDriveId':drive.get('id'),'photoName':f.filename,'updatedAt':now()}})
@@ -1454,6 +1476,36 @@ def member_photo(member_id):
     try:
         data=drive_download_bytes_by_id(m['photoDriveId']); meta=drive_metadata(m['photoDriveId'])[2]; return Response(data,mimetype=meta.get('mimeType','image/jpeg'),headers={'Cache-Control':'public, max-age=3600'})
     except Exception: return Response('Not found',404)
+
+@app.post('/api/membership/change-plan')
+@login_required
+def membership_change_plan():
+    """Create a new membership payment when a member wants to change/upgrade tier.
+    The existing membership remains active until the new payment is approved.
+    """
+    m=_member_doc()
+    if not m or not m.get('emailVerified'): return json_error('Verify your email before changing your membership plan.',403,'EMAIL_NOT_VERIFIED')
+    m=sync_membership_state(m); b=request.get_json(silent=True) or {}; plan=_membership_plan(str(b.get('planId','')))
+    if not plan: return json_error('Membership plan not found.',404,'PLAN_NOT_FOUND')
+    current_id=m.get('membershipPlanId')
+    if current_id==plan.get('id'): return json_error('You are already on this membership plan.',409,'PLAN_UNCHANGED')
+    state=membership_state(m)
+    if state not in {'ACTIVE','EXPIRING_SOON','EXPIRED','PENDING_PAYMENT','PAYMENT_FAILED','PAYMENT_PENDING','RENEWAL_PENDING'}:
+        return json_error('Your membership is not ready for a plan change.',409,'MEMBERSHIP_STATE')
+    amount=float(plan['price']); pid=make_id('PAY'); receipt='GLDC-RCP-'+secrets.token_hex(5).upper(); renewal_id=make_id('REN')
+    pay={'id':pid,'memberId':m['id'],'email':m['email'],'phone':m['phone'],'amount':amount,'currency':plan.get('currency','KES'),'planId':plan['id'],'planName':plan['name'],'method':'M-PESA','status':'PENDING','receiptCode':receipt,'purpose':'MEMBERSHIP_UPGRADE','renewalId':renewal_id,'createdAt':now(),'updatedAt':now(),'source':'MEMBERSHIP'}
+    try:
+        db.payments.insert_one(pay)
+        db.membership_renewals.insert_one({'id':renewal_id,'memberId':m['id'],'paymentId':pid,'planId':plan['id'],'planName':plan['name'],'status':'PENDING_PAYMENT','type':'UPGRADE','createdAt':now(),'updatedAt':now()})
+        r=daraja_stk(m['phone'],int(amount),m.get('membershipNumber') or m['id'],f"GLDC {plan['name']} membership upgrade")
+        db.payments.update_one({'id':pid},{'$set':{'merchantRequestId':r.get('MerchantRequestID'),'checkoutRequestId':r.get('CheckoutRequestID'),'responseDescription':r.get('ResponseDescription')}})
+        db.membership_renewals.update_one({'id':renewal_id},{'$set':{'status':'PAYMENT_PENDING','updatedAt':now()}})
+        return jsonify(ok=True,paymentId=pid,renewalId=renewal_id,receiptCode=receipt,status='PENDING',message=r.get('CustomerMessage','Payment prompt sent. Approve it on your phone.'))
+    except Exception as e:
+        app.logger.exception('Membership plan change failed')
+        db.payments.update_one({'id':pid},{'$set':{'status':'FAILED','error':str(e),'updatedAt':now()}})
+        db.membership_renewals.update_one({'id':renewal_id},{'$set':{'status':'PAYMENT_FAILED','updatedAt':now()}})
+        return json_error('We could not start the plan-change payment. Your current membership has not been changed.',502,'PLAN_CHANGE_FAILED')
 
 @app.post('/api/membership/subscribe')
 @login_required
@@ -1517,7 +1569,7 @@ def admin_member_decision(member_id):
         plan=_membership_plan(m.get('membershipPlanId','')) or db.membership_plans.find_one({'name':m.get('membershipPlan')})
         if not plan: return json_error('Membership plan not found.',409,'PLAN_NOT_FOUND')
         old_certificate_number=m.get('certificateNumber')
-        is_renewal=bool(m.get('paymentId') and db.payments.find_one({'id':m.get('paymentId'),'purpose':'MEMBERSHIP_RENEWAL'}))
+        is_renewal=bool(m.get('paymentId') and db.payments.find_one({'id':m.get('paymentId'),'purpose':{'$in':['MEMBERSHIP_RENEWAL','MEMBERSHIP_UPGRADE']}}))
         issue_date=now()
         if is_renewal and m.get('validUntil'):
             base=m.get('validUntil'); base=base.replace(tzinfo=timezone.utc) if getattr(base,'tzinfo',None) is None else base
@@ -1540,7 +1592,7 @@ def admin_member_decision(member_id):
         _send_member_email('membership_certificate',m,{'name':m['name'],'membershipNumber':number,'plan':plan['name'],'validUntil':str(valid)[:10],'certificateNumber':cert,'subject':'Your GLDC Membership Certificate','text':f'Your GLDC membership has been approved. Certificate {cert}.','html':f'<div style="font-family:Arial;max-width:640px;margin:auto"><h2 style="color:#8B4A18">Membership Approved</h2><p>Dear {m["name"]},</p><p>Your {"renewal" if is_renewal else "membership"} has been approved.</p><p><b>Membership No:</b> {number}<br><b>Plan:</b> {plan["name"]}<br><b>Valid:</b> {str(from_date)[:10]} to {str(valid)[:10]}<br><b>Certificate:</b> {cert}</p></div>'},[('GLDC-'+cert+'.pdf',pdf,'application/pdf')])
     else:
         status='CHANGES_REQUIRED' if decision=='REQUEST_CHANGES' else 'REJECTED'; note=str(b.get('message','Please review and update your membership details.')).strip(); db.members.update_one({'_id':m['_id']},{'$set':{'status':status,'adminMessage':note,'updatedAt':now()}})
-        if m.get('paymentId') and db.payments.find_one({'id':m.get('paymentId'),'purpose':'MEMBERSHIP_RENEWAL'}): db.membership_renewals.update_one({'paymentId':m.get('paymentId')},{'$set':{'status':status,'adminMessage':note,'updatedAt':now()}})
+        if m.get('paymentId') and db.payments.find_one({'id':m.get('paymentId'),'purpose':{'$in':['MEMBERSHIP_RENEWAL','MEMBERSHIP_UPGRADE']}}): db.membership_renewals.update_one({'paymentId':m.get('paymentId')},{'$set':{'status':status,'adminMessage':note,'updatedAt':now()}})
         edit_url=f'{APP_URL}/member/dashboard?edit=1'; _send_member_email('membership_changes',m,{'name':m['name'],'message':note,'editUrl':edit_url,'subject':'GLDC Membership – action required','text':f'Please review your membership details: {edit_url}','html':f'<div style="font-family:Arial;max-width:640px;margin:auto"><h2 style="color:#8B4A18">Membership details need your attention</h2><p>Dear {m["name"]},</p><p>{note}</p><p><a href="{edit_url}">EDIT MY DETAILS</a></p></div>'})
     audit('MEMBERSHIP_DECISION','member',member_id,{'decision':decision}); return jsonify(ok=True,status='ACTIVE' if decision=='APPROVE' else ('CHANGES_REQUIRED' if decision=='REQUEST_CHANGES' else 'REJECTED'))
 
