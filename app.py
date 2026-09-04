@@ -1,4 +1,5 @@
-import os, re, json, base64, hashlib, secrets, smtplib, time
+import os, re, json, base64, hashlib, secrets, smtplib, time, socket
+from urllib.parse import urlsplit, urlunsplit
 from datetime import datetime, timedelta, timezone, date
 from functools import wraps
 from email.message import EmailMessage
@@ -651,6 +652,47 @@ def normalize_mpesa_phone(phone):
         raise RuntimeError('INVALID_MPESA_PHONE:Use a Kenyan mobile number such as 0712345678 or +254712345678.')
     return raw
 
+def daraja_callback_url(validate=True):
+    """Return ONE canonical public callback URL used by every STK request.
+
+    DARAJA_CALLBACK_URL is optional: when omitted, APP_URL +
+    /api/payments/callback is used. A root website URL is also accepted and
+    automatically receives the callback path. We deliberately never accept a
+    callback supplied by a browser/admin form, so member, public and admin
+    payments all report to the same server endpoint.
+    """
+    raw=str(env('DARAJA_CALLBACK_URL', default='')).strip()
+    if not raw:
+        raw=str(APP_URL).strip() + '/api/payments/callback'
+    parts=urlsplit(raw)
+    if not parts.scheme or not parts.netloc:
+        raise RuntimeError('DARAJA_CALLBACK_INVALID: DARAJA_CALLBACK_URL must be a full HTTPS URL, e.g. https://yourdomain.co.ke/api/payments/callback.')
+    if parts.scheme.lower() != 'https':
+        raise RuntimeError('DARAJA_CALLBACK_INVALID: Daraja requires an HTTPS public callback URL.')
+    host=(parts.hostname or '').lower().rstrip('.')
+    if host in {'localhost','127.0.0.1','0.0.0.0','::1'} or host.endswith('.local') or host.endswith('.localhost'):
+        raise RuntimeError('DARAJA_CALLBACK_INVALID: The callback host must be publicly reachable; localhost/private hosts are not allowed.')
+    # A URL supplied as the website root is convenient in Vercel/hosting envs.
+    path=parts.path.rstrip('/')
+    if not path or path == '':
+        path='/api/payments/callback'
+    elif path != '/api/payments/callback':
+        # Accept a configured custom callback path only when explicitly enabled.
+        # The default route remains canonical and is what all application flows use.
+        if not env_bool('DARAJA_ALLOW_CUSTOM_CALLBACK_PATH', default=False):
+            raise RuntimeError('DARAJA_CALLBACK_INVALID: Use https://yourdomain/api/payments/callback, or explicitly enable DARAJA_ALLOW_CUSTOM_CALLBACK_PATH for a custom callback route.')
+    # Query strings/fragments can cause Daraja validation failures and are not
+    # needed for routing because payment IDs are matched from CheckoutRequestID.
+    if parts.query or parts.fragment:
+        raise RuntimeError('DARAJA_CALLBACK_INVALID: Remove query strings and fragments from DARAJA_CALLBACK_URL.')
+    canonical=urlunsplit(('https',parts.netloc,path,'','')).rstrip('/')
+    if validate and env_bool('DARAJA_CALLBACK_REACHABILITY_CHECK', default=True):
+        # Do not fail a payment because an internal server cannot loop back to
+        # itself; this is only a fast diagnostic when the URL is externally
+        # configured. The actual Daraja request remains the source of truth.
+        pass
+    return canonical
+
 def daraja_token():
     base='https://api.safaricom.co.ke' if str(env('DARAJA_ENV','DARAJA_ENVIRONMENT', default='production')).lower()=='production' else 'https://sandbox.safaricom.co.ke'
     key=str(env('DARAJA_CONSUMER_KEY', default=''))
@@ -680,8 +722,7 @@ def daraja_stk(phone,amount,reference,description):
         raise RuntimeError('DARAJA_CONFIG_MISSING:Configure DARAJA_TILL_NUMBER for CustomerBuyGoodsOnline.')
     base,access=daraja_token(); ts=datetime.now().strftime('%Y%m%d%H%M%S')
     password=base64.b64encode(f'{short}{passkey}{ts}'.encode()).decode()
-    callback=str(env('DARAJA_CALLBACK_URL', default=APP_URL + '/api/payments/callback')).strip().rstrip('/')
-    if not callback.endswith('/api/payments/callback'): callback += '/api/payments/callback'
+    callback=daraja_callback_url()
     # IMPORTANT: PartyA is the customer's phone, not the business shortcode.
     body={'BusinessShortCode':short,'Password':password,'Timestamp':ts,'TransactionType':transaction_type,'Amount':amount,'PartyA':customer,'PartyB':till or short,'PhoneNumber':customer,'CallBackURL':callback,'AccountReference':str(reference)[:12],'TransactionDesc':str(description)[:13]}
     r=requests.post(base+'/mpesa/stkpush/v1/processrequest',headers={'Authorization':'Bearer '+access,'Content-Type':'application/json'},json=body,timeout=30)
@@ -726,7 +767,6 @@ def validate_production_config():
             ('DARAJA_SHORTCODE', 'DARAJA_PARTY_A_SHORTCODE'),
             ('DARAJA_TILL_NUMBER', 'DARAJA_PARTY_B_BUYGOODS_TILL', 'DARAJA_BUYGOODS_TILL'),
             ('DARAJA_PASSKEY',),
-            ('DARAJA_CALLBACK_URL',),
         ]
         for group in daraja_groups:
             if not any(env(k) for k in group):
@@ -1235,6 +1275,15 @@ def api_stk():
     except Exception as e:
         db.payments.update_one({'id':pid},{'$set':{'status':'FAILED','error':'Daraja request failed','updatedAt':now()}}); return json_error(str(e),500)
 
+@app.get('/api/payments/callback')
+def api_callback_probe():
+    # Public, unauthenticated probe. Daraja may validate the callback URL before
+    # accepting an STK request, so this route must be reachable without CSRF/auth.
+    try:
+        return jsonify(ok=True, service='gldc-mpesa-callback', status='READY'), 200
+    except Exception:
+        return Response('{\"ok\":true}', status=200, mimetype='application/json')
+
 @app.post('/api/payments/callback')
 def api_callback():
     try:
@@ -1395,6 +1444,32 @@ def cron_check_abandoned_registrations():
         _notify_admin_member_abandoned(entry)
     return jsonify(ok=True, checked=len(entries), notified=len(entries))
 
+@app.get('/api/admin/daraja/callback-check')
+@admin_required
+def admin_daraja_callback_check():
+    """Validate and probe the single callback URL used by every STK flow."""
+    try:
+        callback=daraja_callback_url(validate=True)
+        result={'url':callback,'formatValid':True,'publicProbe':False}
+        try:
+            r=requests.get(callback,headers={'User-Agent':'GLDC-Daraja-Callback-Check/1.0','Accept':'application/json'},timeout=8,allow_redirects=False)
+            result['httpStatus']=r.status_code
+            result['publicProbe']=r.status_code==200
+            if r.status_code==200:
+                result['message']='Callback URL is public, HTTPS and returned HTTP 200. It is ready for Daraja callbacks.'
+            elif 300 <= r.status_code < 400:
+                result['message']=f'Callback URL redirected with HTTP {r.status_code}. Use the final HTTPS URL directly; Daraja callbacks should not require redirects.'
+            else:
+                result['message']=f'Callback URL returned HTTP {r.status_code}. It must be publicly reachable and return HTTP 200 without authentication.'
+        except Exception as probe_error:
+            result['probeError']=str(probe_error)
+            result['message']='The URL format is valid, but this server could not prove external reachability. Ensure the URL is public HTTPS, has no login/CSRF protection, and returns HTTP 200.'
+        return jsonify(ok=True,daraja=result)
+    except RuntimeError as e:
+        return json_error(str(e),422,'DARAJA_CALLBACK_INVALID')
+    except Exception as e:
+        return json_error('Callback check failed: '+str(e),500,'DARAJA_CALLBACK_CHECK_FAILED')
+
 @app.get('/api/admin/daraja/test')
 @admin_required
 def admin_daraja_test():
@@ -1407,13 +1482,19 @@ def admin_daraja_test():
         'DARAJA_SHORTCODE': ('DARAJA_SHORTCODE','DARAJA_PARTY_A_SHORTCODE'),
         'DARAJA_TILL_NUMBER': ('DARAJA_TILL_NUMBER','DARAJA_PARTY_B_BUYGOODS_TILL','DARAJA_BUYGOODS_TILL'),
         'DARAJA_PASSKEY': ('DARAJA_PASSKEY',),
-        'DARAJA_CALLBACK_URL': ('DARAJA_CALLBACK_URL',),
     }
     missing = [name for name, aliases in groups.items() if not any(env(k) for k in aliases)]
+    callback_error=None
+    try:
+        callback_url=daraja_callback_url(validate=True)
+    except Exception as e:
+        callback_url=''
+        callback_error=str(e)
     result = {
         'darajaEnabled': env_bool('DARAJA_ENABLED', default=True),
         'darajaEnvironment': str(env('DARAJA_ENV','DARAJA_ENVIRONMENT', default='production')),
-        'callbackUrl': str(env('DARAJA_CALLBACK_URL', default=APP_URL + '/api/payments/callback')),
+        'callbackUrl': callback_url,
+        'callbackError': callback_error,
         'missingConfig': missing,
         'oauth': None,
     }
