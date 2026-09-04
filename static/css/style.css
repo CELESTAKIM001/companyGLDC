@@ -9,3 +9,19 @@
 @media(max-width:820px){.nav-links .nav-dropdown{display:block;width:100%}.nav-drop-trigger{width:100%;justify-content:space-between;padding:11px 0}.nav-dropdown-menu{position:static;min-width:0;margin:0 0 4px;padding:5px;background:#faf7f3;border-radius:9px;box-shadow:none;border:1px solid var(--line);display:none;opacity:1;visibility:visible;transform:none}.nav-dropdown:focus-within .nav-dropdown-menu,.nav-dropdown:hover .nav-dropdown-menu{display:grid}.nav-dropdown-menu a{padding:10px 12px}.mp-sidebar{flex-basis:248px}}
 @media(max-width:900px){.mp-content{padding:28px 24px 60px}.mp-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}.mp-layout{grid-template-columns:1fr}.mp-two{grid-template-columns:1fr}.mp-hero-grid{grid-template-columns:1fr}.mp-hero-actions{justify-content:flex-start}}
 @media(max-width:600px){.mp-sidebar{width:290px;max-width:88vw}.mp-content{padding:22px 15px 50px}.mp-kpis{grid-template-columns:1fr}.mp-top h1{font-size:28px}.mp-card{padding:18px}.mp-info-grid{grid-template-columns:1fr}.mp-timeline{min-width:620px}.mp-hero{padding:22px}.mp-profile-head{align-items:flex-start}.mp-photo{width:62px;height:62px}}
+
+/* V46: compact Admin Membership controls and certificate history layout */
+.full-console .btn.xs,
+.admin-shell .btn.xs{min-height:30px;padding:5px 8px;font-size:.68rem;line-height:1.05;border-radius:7px;gap:5px;white-space:nowrap}
+.member-crud-cell{min-width:220px;width:1%}
+.member-crud-actions{display:flex;align-items:center;justify-content:flex-start;gap:5px;flex-wrap:wrap;max-width:270px}
+.certificate-history-panel{min-width:0;overflow:hidden}
+.certificate-history-list{min-width:0;width:100%;overflow:hidden}
+.certificate-history-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:14px;align-items:center;padding:13px 0;border-bottom:1px solid var(--line);min-width:0}
+.certificate-history-row:last-child{border-bottom:0}
+.certificate-history-info{min-width:0;overflow:hidden}
+.certificate-number{font-weight:900;overflow-wrap:anywhere;word-break:break-word}
+.certificate-member{margin-top:2px;font-weight:700;overflow-wrap:anywhere;word-break:break-word}
+.certificate-meta{margin-top:3px;color:var(--muted);font-size:.76rem;overflow-wrap:anywhere}
+.certificate-history-actions{display:flex;align-items:center;justify-content:flex-end;gap:5px;flex-wrap:wrap;max-width:100%;min-width:0}
+@media(max-width:760px){.certificate-history-row{grid-template-columns:1fr;gap:9px}.certificate-history-actions{justify-content:flex-start}.member-crud-cell{min-width:180px}.member-crud-actions{max-width:220px}}

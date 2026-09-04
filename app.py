@@ -268,37 +268,49 @@ def _draw_qr(c, value, x, y, size=24*mm):
     except Exception: pass
 
 def build_invoice_pdf(invoice):
+    """Create a clean one-page invoice with non-overlapping header, body and QR footer."""
     buf=BytesIO(); c=canvas.Canvas(buf,pagesize=A4); w,h=A4; company=_company_profile()
     c.setTitle(invoice['invoiceNumber'])
-    # compact one-page professional invoice
-    logo_id=company.get('logo_drive_id')
     logo_path=os.path.join(os.path.dirname(__file__),'static','assets','gldc-logo.png')
-    try: c.drawImage(ImageReader(logo_path),20*mm,h-35*mm,width=30*mm,height=15*mm,mask='auto')
-    except Exception: pass
-    c.setFont('Helvetica-Bold',16); c.drawString(53*mm,h-23*mm,company['name'])
-    c.setFont('Helvetica',8.5); c.drawString(53*mm,h-29*mm,company['tagline'])
-    c.setFont('Helvetica',8); c.drawString(20*mm,h-35*mm,' • '.join(x for x in [company['phone'],company['email'],company['location']] if x))
-    c.setFont('Helvetica-Bold',17); c.drawRightString(w-20*mm,h-23*mm,'INVOICE')
-    c.setFont('Helvetica',9); c.drawRightString(w-20*mm,h-30*mm,invoice['invoiceNumber'])
-    c.setStrokeColorRGB(.55,.29,.09); c.line(20*mm,h-39*mm,w-20*mm,h-39*mm)
-    y=h-52*mm
+    # Header: keep all text to the right of the logo so no company/contact text crosses it.
+    try:
+        c.drawImage(ImageReader(logo_path),20*mm,h-35*mm,width=30*mm,height=15*mm,mask='auto')
+    except Exception:
+        pass
+    c.setFont('Helvetica-Bold',16); c.drawString(55*mm,h-22*mm,company['name'])
+    c.setFont('Helvetica',8.5); c.drawString(55*mm,h-28*mm,company['tagline'])
+    contact=' • '.join(x for x in [company['phone'],company['email'],company['location']] if x)
+    if contact:
+        c.setFont('Helvetica',7.5); c.drawString(55*mm,h-34*mm,contact[:115])
+    c.setFont('Helvetica-Bold',17); c.drawRightString(w-20*mm,h-22*mm,'INVOICE')
+    c.setFont('Helvetica',9); c.drawRightString(w-20*mm,h-29*mm,invoice['invoiceNumber'])
+    c.setStrokeColorRGB(.55,.29,.09); c.line(20*mm,h-40*mm,w-20*mm,h-40*mm)
+
+    y=h-54*mm
     c.setFont('Helvetica-Bold',9); c.drawString(20*mm,y,'BILL TO'); c.drawRightString(w-20*mm,y,'ISSUED / DUE')
-    c.setFont('Helvetica',9); c.drawString(20*mm,y-6*mm,invoice.get('recipientName') or invoice.get('recipientEmail','')); c.drawString(20*mm,y-12*mm,invoice.get('recipientEmail',''))
+    c.setFont('Helvetica',9); c.drawString(20*mm,y-6*mm,str(invoice.get('recipientName') or invoice.get('recipientEmail',''))[:75])
+    c.drawString(20*mm,y-12*mm,str(invoice.get('recipientEmail',''))[:75])
     c.drawRightString(w-20*mm,y-6*mm,str(invoice.get('issuedAt',''))[:10]+'  /  '+(invoice.get('dueDate') or 'On receipt'))
-    y-=28*mm
+
+    y-=29*mm
     c.setFont('Helvetica-Bold',9); c.drawString(20*mm,y,'DESCRIPTION'); c.drawRightString(w-20*mm,y,'AMOUNT')
     c.line(20*mm,y-3*mm,w-20*mm,y-3*mm)
-    c.setFont('Helvetica',9); desc=str(invoice.get('description','')); c.drawString(20*mm,y-11*mm,desc[:105]); c.drawRightString(w-20*mm,y-11*mm,f"KES {float(invoice.get('amount',0)):,.2f}")
+    c.setFont('Helvetica',9); desc=str(invoice.get('description',''))
+    c.drawString(20*mm,y-11*mm,desc[:105]); c.drawRightString(w-20*mm,y-11*mm,f"KES {float(invoice.get('amount',0)):,.2f}")
     c.line(20*mm,y-18*mm,w-20*mm,y-18*mm)
     paid=float(invoice.get('amountPaid',0) or 0); total=float(invoice.get('amount',0) or 0); balance=max(total-paid,0)
     c.setFont('Helvetica',9); c.drawRightString(w-20*mm,y-27*mm,f'Amount paid: KES {paid:,.2f}')
     c.setFont('Helvetica-Bold',13); c.drawRightString(w-20*mm,y-36*mm,f'BALANCE: KES {balance:,.2f}')
+
+    # Dedicated footer band. No printed website URL; the QR remains the compact verification mechanism.
+    footer_y=25*mm
+    c.setStrokeColorRGB(.82,.78,.72); c.line(20*mm,footer_y+42*mm,w-20*mm,footer_y+42*mm)
     qr_value=invoice_verification_url(invoice['invoiceNumber'])
-    _draw_qr(c,qr_value,20*mm,28*mm,25*mm)
-    c.setFont('Helvetica-Bold',8); c.drawString(49*mm,45*mm,'VERIFY / PAY')
-    c.setFont('Helvetica',7.5); c.drawString(49*mm,40*mm,'Scan the QR code to verify this invoice or continue to payment.')
-    c.setFont('Helvetica',7.5); c.drawString(49*mm,35*mm,'Thank you for choosing GLDC.')
-    c.setFont('Helvetica',7.5); c.drawRightString(w-20*mm,25*mm,'Generated electronically • Keep this invoice for your records')
+    _draw_qr(c,qr_value,20*mm,footer_y,27*mm)
+    c.setFont('Helvetica-Bold',8); c.drawString(51*mm,footer_y+23*mm,'SCAN TO VERIFY INVOICE')
+    c.setFont('Helvetica',7.5); c.drawString(51*mm,footer_y+17*mm,'Use the QR code to verify this invoice securely.')
+    c.drawString(51*mm,footer_y+12*mm,'No website address is printed on the invoice.')
+    c.setFont('Helvetica',7.5); c.drawRightString(w-20*mm,footer_y+7*mm,'Generated electronically • Keep this invoice for your records')
     c.save(); return buf.getvalue()
 
 def build_receipt_pdf(payment, membership=None):
@@ -319,34 +331,66 @@ def build_receipt_pdf(payment, membership=None):
     c.save(); return buf.getvalue()
 
 def build_membership_certificate(member, plan, certificate_no, valid_from=None, valid_until=None, issue_date=None):
+    """Create the official GLDC membership certificate with fixed, non-overlapping zones."""
     buf=BytesIO(); c=canvas.Canvas(buf,pagesize=A4); w,h=A4; c.setTitle(certificate_no)
     valid_from=valid_from or member.get('validFrom'); valid_until=valid_until or member.get('validUntil'); issue_date=issue_date or now()
     def d(v): return str(v)[:10] if v else ''
-    c.setLineWidth(2); c.rect(14*mm,14*mm,w-28*mm,h-28*mm); c.setLineWidth(.6); c.rect(19*mm,19*mm,w-38*mm,h-38*mm)
+
+    # Border
+    c.setLineWidth(2); c.rect(14*mm,14*mm,w-28*mm,h-28*mm)
+    c.setLineWidth(.6); c.rect(19*mm,19*mm,w-38*mm,h-38*mm)
+
+    # Header zone — logo and titles have dedicated vertical space.
     logo_path=os.path.join(os.path.dirname(__file__),'static','assets','gldc-logo.png')
-    try: c.drawImage(ImageReader(logo_path),w/2-25*mm,h-38*mm,width=50*mm,height=25*mm,mask='auto')
-    except Exception: pass
-    c.setFont('Helvetica-Bold',12); c.drawCentredString(w/2,h-48*mm,'GAVIN LAND & DESIGN CONSULTANTS')
-    c.setFont('Helvetica-Bold',24); c.drawCentredString(w/2,h-62*mm,'MEMBERSHIP CERTIFICATE')
-    c.setFont('Helvetica',11); c.drawCentredString(w/2,h-79*mm,'This certifies that')
-    c.setFont('Helvetica-Bold',20); c.drawCentredString(w/2,h-96*mm,str(member.get('name',''))[:70])
-    c.setFont('Helvetica',11); c.drawCentredString(w/2,h-113*mm,'is an approved member of GLDC under the following membership plan:')
-    c.setFont('Helvetica-Bold',14); c.drawCentredString(w/2,h-130*mm,str(plan.get('name',''))[:60])
-    c.setFont('Helvetica',10); c.drawCentredString(w/2,h-145*mm,f"Membership No: {member.get('membershipNumber',member.get('id',''))}")
-    c.drawCentredString(w/2,h-153*mm,f"Valid: {d(valid_from)} to {d(valid_until)}")
-    c.drawCentredString(w/2,h-161*mm,f"Certificate: {certificate_no}   •   Issued: {d(issue_date)}")
-    _draw_qr(c,certificate_verification_url(certificate_no),w/2-15*mm,31*mm,30*mm)
-    c.setFont('Helvetica',8); c.drawCentredString(w/2,27*mm,'Scan to verify this certificate and its membership period.')
-    # Official GLDC authorization block: leave a clear signature line for the
-    # authorized GLDC representative while retaining the digital QR verification.
-    sig_x=48*mm; sig_y=31*mm
-    c.setLineWidth(.8); c.line(sig_x, sig_y, sig_x+55*mm, sig_y)
-    c.setFont('Helvetica-Bold',8); c.drawCentredString(sig_x+27.5*mm, sig_y-5*mm,'AUTHORIZED SIGNATURE — GLDC')
-    c.setFont('Helvetica',7); c.drawCentredString(sig_x+27.5*mm, sig_y-9*mm,'For and on behalf of Gavin Land & Design Consultants')
-    # Small official seal mark beside the signature block.
-    c.setLineWidth(1); c.circle(sig_x+66*mm, sig_y+1*mm, 9*mm)
-    c.setFont('Helvetica-Bold',7); c.drawCentredString(sig_x+66*mm, sig_y+2*mm,'GLDC')
-    c.setFont('Helvetica',5.5); c.drawCentredString(sig_x+66*mm, sig_y-2.5*mm,'OFFICIAL')
+    try:
+        c.drawImage(ImageReader(logo_path),w/2-25*mm,h-37*mm,width=50*mm,height=25*mm,mask='auto')
+    except Exception:
+        pass
+    c.setFillColorRGB(.55,.29,.09)
+    c.setFont('Helvetica-Bold',11); c.drawCentredString(w/2,h-47*mm,'GAVIN LAND & DESIGN CONSULTANTS')
+    c.setFillColorRGB(0,0,0)
+    c.setFont('Helvetica-Bold',23); c.drawCentredString(w/2,h-60*mm,'MEMBERSHIP CERTIFICATE')
+    c.setFont('Helvetica',10.5); c.drawCentredString(w/2,h-73*mm,'This certifies that')
+    c.setFont('Helvetica-Bold',19); c.drawCentredString(w/2,h-87*mm,str(member.get('name',''))[:70])
+    c.setFont('Helvetica',10.5); c.drawCentredString(w/2,h-99*mm,'is an approved member of GLDC under the following membership plan:')
+    c.setFont('Helvetica-Bold',14); c.drawCentredString(w/2,h-111*mm,str(plan.get('name',''))[:60])
+
+    # Metadata zone — generous row spacing and a subtle container.
+    meta_left=39*mm; meta_right=w-39*mm; meta_top=h-124*mm; meta_bottom=h-158*mm
+    c.setStrokeColorRGB(.84,.78,.69); c.roundRect(meta_left,meta_bottom,meta_right-meta_left,meta_top-meta_bottom,3*mm,stroke=1,fill=0)
+    c.setFillColorRGB(.55,.29,.09); c.setFont('Helvetica-Bold',8)
+    c.drawString(meta_left+6*mm,meta_top-8*mm,'MEMBERSHIP DETAILS')
+    c.setFillColorRGB(0,0,0); c.setFont('Helvetica',9.5)
+    c.drawString(meta_left+6*mm,meta_top-17*mm,f"Membership No: {member.get('membershipNumber',member.get('id',''))}")
+    c.drawString(meta_left+6*mm,meta_top-25*mm,f"Valid from: {d(valid_from)}")
+    c.drawString(meta_left+82*mm,meta_top-25*mm,f"Valid until: {d(valid_until)}")
+    c.drawString(meta_left+6*mm,meta_top-33*mm,f"Certificate ID: {certificate_no}")
+    c.drawRightString(meta_right-6*mm,meta_top-33*mm,f"Issued: {d(issue_date)}")
+
+    # Dedicated authorization footer zone. QR, signature and stamp are separate columns.
+    footer_bottom=25*mm; footer_top=60*mm
+    c.setStrokeColorRGB(.84,.78,.69); c.line(28*mm,footer_top,w-28*mm,footer_top)
+    # QR column
+    qr_x=29*mm; qr_y=footer_bottom+1*mm; qr_size=27*mm
+    _draw_qr(c,certificate_verification_url(certificate_no),qr_x,qr_y,qr_size)
+    c.setFillColorRGB(0,0,0); c.setFont('Helvetica-Bold',7.5)
+    c.drawCentredString(qr_x+qr_size/2,footer_bottom-1*mm+0*mm,'SCAN TO VERIFY')
+    c.setFont('Helvetica',6.8); c.drawCentredString(qr_x+qr_size/2,footer_bottom-5*mm,'Certificate record')
+
+    # Signature column
+    sig_left=87*mm; sig_width=55*mm; sig_line_y=footer_bottom+16*mm
+    c.setStrokeColorRGB(0,0,0); c.setLineWidth(.8); c.line(sig_left,sig_line_y,sig_left+sig_width,sig_line_y)
+    c.setFont('Helvetica-Bold',8); c.drawCentredString(sig_left+sig_width/2,sig_line_y-5*mm,'AUTHORIZED SIGNATURE')
+    c.setFont('Helvetica',6.8); c.drawCentredString(sig_left+sig_width/2,sig_line_y-9*mm,'For and on behalf of GLDC')
+
+    # Stamp column — physically separate from signature and QR.
+    stamp_cx=174*mm; stamp_cy=footer_bottom+18*mm; stamp_r=11*mm
+    c.setLineWidth(1); c.circle(stamp_cx,stamp_cy,stamp_r)
+    c.setFont('Helvetica-Bold',8); c.drawCentredString(stamp_cx,stamp_cy+1*mm,'GLDC')
+    c.setFont('Helvetica',5.8); c.drawCentredString(stamp_cx,stamp_cy-3.5*mm,'OFFICIAL STAMP')
+
+    # Footer note sits below the three-column authorization area, never on top of it.
+    c.setFont('Helvetica',6.8); c.drawCentredString(w/2,18*mm,'This certificate is valid only for the membership period shown above.')
     c.save(); return buf.getvalue()
 
 def email_template_render(name, variables):
