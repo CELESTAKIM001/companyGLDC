@@ -395,84 +395,147 @@ def build_invoice_pdf(invoice):
     c.setFont('Helvetica',6.8); c.drawRightString(w-20*mm,footer_y-1*mm,'Generated electronically • Keep this invoice for your records')
     c.save(); return buf.getvalue()
 
+def _brand_pdf_colors(c):
+    """Apply the GLDC production document palette."""
+    return {
+        'blue': (3/255, 43/255, 136/255),
+        'tint': (240/255, 244/255, 250/255),
+        'text': (27/255, 27/255, 27/255),
+        'border': (209/255, 213/255, 219/255),
+    }
+
+def _draw_header_logo(c, w, h, centered=True):
+    """Draw the official logo with a hard maximum height of 60px-equivalent."""
+    # 60 CSS px at 96dpi is 45pt ~= 15.9mm. Keep a small safety margin.
+    max_h = 15*mm
+    max_w = 42*mm
+    logo_path=os.path.join(os.path.dirname(__file__),'static','assets','gldc-logo.png')
+    try:
+        img=ImageReader(logo_path)
+        iw, ih = img.getSize()
+        scale=min(max_w/float(iw), max_h/float(ih))
+        dw, dh=iw*scale, ih*scale
+        x=(w-dw)/2 if centered else 20*mm
+        y=h-19*mm-dh
+        c.drawImage(img,x,y,width=dw,height=dh,mask='auto')
+        return y, dh
+    except Exception:
+        return h-35*mm, 0
+
+def _draw_key_value_table(c, rows, x, y_top, width, row_h=10*mm):
+    """Draw a padded, bordered GLDC key/value table with alternating tint rows."""
+    colors=_brand_pdf_colors(c)
+    label_w=42*mm
+    for i,(key,value) in enumerate(rows):
+        y=y_top-i*row_h
+        if i % 2 == 1:
+            c.setFillColorRGB(*colors['tint']); c.rect(x,y-row_h,width,row_h,stroke=0,fill=1)
+        c.setStrokeColorRGB(*colors['border']); c.setLineWidth(.45)
+        c.rect(x,y-row_h,width,row_h,stroke=1,fill=0)
+        c.setFillColorRGB(*colors['blue']); c.setFont('Helvetica-Bold',8.5)
+        c.drawString(x+4*mm,y-6.5*mm,str(key).upper())
+        c.setFillColorRGB(*colors['text']); c.setFont('Helvetica',9)
+        c.drawString(x+label_w,y-6.5*mm,str(value)[:90])
+
+
 def build_receipt_pdf(payment, membership=None):
     buf=BytesIO(); c=canvas.Canvas(buf,pagesize=A4); w,h=A4; company=_company_profile()
+    colors=_brand_pdf_colors(c)
     code=payment.get('receiptCode') or payment.get('mpesaReceiptNumber') or payment.get('id','Receipt')
     verify_url=receipt_verification_url(code)
     c.setTitle(code)
-    c.setFont('Helvetica-Bold',20); c.drawString(22*mm,h-28*mm,company['name']); c.setFont('Helvetica-Bold',16); c.drawRightString(w-22*mm,h-28*mm,'PAYMENT RECEIPT')
-    c.setFont('Helvetica',9); c.drawString(22*mm,h-35*mm,company['tagline']); c.line(22*mm,h-41*mm,w-22*mm,h-41*mm)
-    y=h-60*mm; rows=[('Receipt code',code),('Member',(membership or {}).get('name') or payment.get('memberName','')),('Email',(membership or {}).get('email') or payment.get('email','')),('Plan',payment.get('planName','')),('Amount',f"KES {float(payment.get('amount',0)):,.2f}"),('Method',payment.get('method','M-PESA')),('Transaction',payment.get('mpesaReceiptNumber') or payment.get('reference') or ''),('Date',str(payment.get('createdAt',''))[:19].replace('T',' ')),('Status',payment.get('status','RECORDED'))]
-    for k,v in rows:
-        c.setFont('Helvetica-Bold',9); c.drawString(22*mm,y,k.upper()); c.setFont('Helvetica',10); c.drawString(65*mm,y,str(v)[:90]); y-=10*mm
-    # Dedicated footer authorization zone: signature, stamp and QR never overlap.
-    footer_y=17*mm
-    _draw_signature(c,23*mm,footer_y+2*mm,43*mm,20*mm)
-    c.setFont('Helvetica-Bold',6.8); c.drawCentredString(44.5*mm,footer_y,'AUTHORIZED SIGNATURE')
-    _draw_digital_stamp(c,82*mm,footer_y,34*mm,34*mm)
-    _draw_qr(c,verify_url,w-54*mm,footer_y+1*mm,28*mm)
-    c.setFont('Helvetica-Bold',7.2); c.drawString(w-94*mm,footer_y+25*mm,'SCAN TO VERIFY RECEIPT')
-    c.setFont('Helvetica',6.8); c.drawString(w-94*mm,footer_y+20*mm,'Official GLDC verification record.')
-    c.setFont('Helvetica',7.2); c.drawString(22*mm,10*mm,'This receipt confirms that the payment record was issued by GLDC. Membership approval remains subject to GLDC review where applicable.')
+
+    # Header: official logo is centered above the primary title and capped at 60px-equivalent.
+    logo_y,logo_h=_draw_header_logo(c,w,h,centered=True)
+    title_y=logo_y-8*mm
+    c.setFillColorRGB(*colors['blue']); c.setFont('Helvetica-Bold',20)
+    c.drawCentredString(w/2,title_y,company['name'])
+    c.setFont('Helvetica-Bold',16); c.drawCentredString(w/2,title_y-9*mm,'PAYMENT RECEIPT')
+    c.setFillColorRGB(*colors['text']); c.setFont('Helvetica',8.5)
+    c.drawCentredString(w/2,title_y-16*mm,company['tagline'])
+    c.setStrokeColorRGB(*colors['blue']); c.setLineWidth(1.2)
+    c.line(20*mm,title_y-21*mm,w-20*mm,title_y-21*mm)
+
+    rows=[
+        ('Receipt code',code),
+        ('Member',(membership or {}).get('name') or payment.get('memberName','')),
+        ('Email',(membership or {}).get('email') or payment.get('email','')),
+        ('Plan',payment.get('planName','')),
+        ('Amount',f"KES {float(payment.get('amount',0)):,.2f}"),
+        ('Method',payment.get('method','M-PESA')),
+        ('Transaction',payment.get('mpesaReceiptNumber') or payment.get('reference') or ''),
+        ('Date',document_generated_date(payment.get('createdAt'))),
+        ('Status',payment.get('status','RECORDED')),
+    ]
+    table_x=20*mm; table_w=w-40*mm; table_top=title_y-30*mm
+    _draw_key_value_table(c,rows,table_x,table_top,table_w,row_h=9.2*mm)
+
+    # Dedicated footer: signature, stamp and QR each have independent bounded zones.
+    footer_bottom=18*mm; footer_top=61*mm
+    c.setStrokeColorRGB(*colors['border']); c.setLineWidth(.7); c.line(20*mm,footer_top,w-20*mm,footer_top)
+    _draw_signature(c,25*mm,footer_bottom+7*mm,45*mm,19*mm)
+    c.setFillColorRGB(*colors['blue']); c.setFont('Helvetica-Bold',6.8)
+    c.drawCentredString(47.5*mm,footer_bottom+4*mm,'AUTHORIZED SIGNATURE')
+    _draw_digital_stamp(c,82*mm,footer_bottom+2*mm,35*mm,35*mm)
+    _draw_qr(c,verify_url,w-54*mm,footer_bottom+3*mm,28*mm)
+    c.setFillColorRGB(*colors['blue']); c.setFont('Helvetica-Bold',7.2)
+    c.drawString(w-94*mm,footer_bottom+28*mm,'SCAN TO VERIFY RECEIPT')
+    c.setFillColorRGB(*colors['text']); c.setFont('Helvetica',6.8)
+    c.drawString(w-94*mm,footer_bottom+23*mm,'Official GLDC verification record.')
+    c.drawCentredString(w/2,9*mm,'This receipt confirms that the payment record was issued by GLDC. Membership approval remains subject to GLDC review where applicable.')
     c.save(); return buf.getvalue()
 
+
 def build_membership_certificate(member, plan, certificate_no, valid_from=None, valid_until=None, issue_date=None):
-    """Create the official GLDC membership certificate with fixed, non-overlapping zones."""
+    """Create the official GLDC membership certificate with bounded, non-overlapping zones."""
     buf=BytesIO(); c=canvas.Canvas(buf,pagesize=A4); w,h=A4; c.setTitle(certificate_no)
+    colors=_brand_pdf_colors(c)
     valid_from=valid_from or member.get('validFrom'); valid_until=valid_until or member.get('validUntil'); issue_date=issue_date or now()
     def d(v): return str(v)[:10] if v else ''
 
-    # Border
-    c.setLineWidth(2); c.rect(14*mm,14*mm,w-28*mm,h-28*mm)
-    c.setLineWidth(.6); c.rect(19*mm,19*mm,w-38*mm,h-38*mm)
+    # Double boundary frame.
+    c.setStrokeColorRGB(*colors['blue']); c.setLineWidth(1.5); c.rect(14*mm,14*mm,w-28*mm,h-28*mm)
+    c.setStrokeColorRGB(*colors['border']); c.setLineWidth(.6); c.rect(19*mm,19*mm,w-38*mm,h-38*mm)
 
-    # Header zone — logo and titles have dedicated vertical space.
-    logo_path=os.path.join(os.path.dirname(__file__),'static','assets','gldc-logo.png')
-    try:
-        c.drawImage(ImageReader(logo_path),w/2-25*mm,h-37*mm,width=50*mm,height=25*mm,mask='auto')
-    except Exception:
-        pass
-    c.setFillColorRGB(.55,.29,.09)
-    c.setFont('Helvetica-Bold',11); c.drawCentredString(w/2,h-47*mm,'GAVIN LAND & DESIGN CONSULTANTS')
-    c.setFillColorRGB(0,0,0)
-    c.setFont('Helvetica-Bold',23); c.drawCentredString(w/2,h-60*mm,'MEMBERSHIP CERTIFICATE')
-    c.setFont('Helvetica',10.5); c.drawCentredString(w/2,h-73*mm,'This certifies that')
-    c.setFont('Helvetica-Bold',19); c.drawCentredString(w/2,h-87*mm,str(member.get('name',''))[:70])
-    c.setFont('Helvetica',10.5); c.drawCentredString(w/2,h-99*mm,'is an approved member of GLDC under the following membership plan:')
-    c.setFont('Helvetica-Bold',14); c.drawCentredString(w/2,h-111*mm,str(plan.get('name',''))[:60])
+    # Header logo: proportional, maximum 60px-equivalent height.
+    logo_y,logo_h=_draw_header_logo(c,w,h,centered=True)
+    brand_y=logo_y-7*mm
+    c.setFillColorRGB(*colors['blue']); c.setFont('Helvetica-Bold',11)
+    c.drawCentredString(w/2,brand_y,'GAVIN LAND & DESIGN CONSULTANTS')
+    c.setFont('Helvetica-Bold',23); c.drawCentredString(w/2,brand_y-13*mm,'MEMBERSHIP CERTIFICATE')
+    c.setFillColorRGB(*colors['text']); c.setFont('Helvetica',10.5)
+    c.drawCentredString(w/2,brand_y-25*mm,'This certifies that')
+    c.setFont('Helvetica-Bold',19); c.drawCentredString(w/2,brand_y-39*mm,str(member.get('name',''))[:70])
+    c.setFont('Helvetica',10.5); c.drawCentredString(w/2,brand_y-51*mm,'is an approved member of GLDC under the following membership plan:')
+    c.setFillColorRGB(*colors['blue']); c.setFont('Helvetica-Bold',14)
+    c.drawCentredString(w/2,brand_y-63*mm,str(plan.get('name',''))[:60])
 
-    # Metadata zone — generous row spacing and a subtle container.
-    meta_left=39*mm; meta_right=w-39*mm; meta_top=h-124*mm; meta_bottom=h-158*mm
-    c.setStrokeColorRGB(.84,.78,.69); c.roundRect(meta_left,meta_bottom,meta_right-meta_left,meta_top-meta_bottom,3*mm,stroke=1,fill=0)
-    c.setFillColorRGB(.55,.29,.09); c.setFont('Helvetica-Bold',8)
-    c.drawString(meta_left+6*mm,meta_top-8*mm,'MEMBERSHIP DETAILS')
-    c.setFillColorRGB(0,0,0); c.setFont('Helvetica',9.5)
-    c.drawString(meta_left+6*mm,meta_top-17*mm,f"Membership No: {member.get('membershipNumber',member.get('id',''))}")
-    c.drawString(meta_left+6*mm,meta_top-25*mm,f"Valid from: {d(valid_from)}")
-    c.drawString(meta_left+82*mm,meta_top-25*mm,f"Valid until: {d(valid_until)}")
-    c.drawString(meta_left+6*mm,meta_top-33*mm,f"Certificate ID: {certificate_no}")
-    c.drawRightString(meta_right-6*mm,meta_top-33*mm,f"Issued: {d(issue_date)}")
+    # Metadata table with 8px/12px-equivalent padding and generous row separation.
+    meta_x=30*mm; meta_w=w-60*mm; meta_top=brand_y-72*mm
+    meta_rows=[
+        ('Membership No',member.get('membershipNumber',member.get('id',''))),
+        ('Valid from',d(valid_from)),
+        ('Valid until',d(valid_until)),
+        ('Certificate ID',certificate_no),
+        ('Issued',d(issue_date)),
+    ]
+    _draw_key_value_table(c,meta_rows,meta_x,meta_top,meta_w,row_h=8.5*mm)
 
-    # Dedicated authorization footer zone. QR, signature and stamp are separate columns.
-    footer_bottom=25*mm; footer_top=60*mm
-    c.setStrokeColorRGB(.84,.78,.69); c.line(28*mm,footer_top,w-28*mm,footer_top)
-    # QR column
-    qr_x=29*mm; qr_y=footer_bottom+1*mm; qr_size=27*mm
-    _draw_qr(c,certificate_verification_url(certificate_no),qr_x,qr_y,qr_size)
-    c.setFillColorRGB(0,0,0); c.setFont('Helvetica-Bold',7.5)
-    c.drawCentredString(qr_x+qr_size/2,footer_bottom-1*mm+0*mm,'SCAN TO VERIFY')
-    c.setFont('Helvetica',6.8); c.drawCentredString(qr_x+qr_size/2,footer_bottom-5*mm,'Certificate record')
-
-    # Signature column — actual transparent SIGN.png when present.
-    _draw_signature(c,87*mm,footer_bottom+6*mm,55*mm,20*mm)
-    c.setFont('Helvetica-Bold',8); c.drawCentredString(114.5*mm,footer_bottom+3*mm,'AUTHORIZED SIGNATURE')
-    c.setFont('Helvetica',6.8); c.drawCentredString(114.5*mm,footer_bottom-1*mm,'For and on behalf of GLDC')
-
-    # Stamp column — actual transparent image_t055yg.png with system date overlay.
-    _draw_digital_stamp(c,158*mm,footer_bottom+2*mm,35*mm,35*mm)
-
-    # Footer note sits below the three-column authorization area, never on top of it.
-    c.setFont('Helvetica',6.8); c.drawCentredString(w/2,17*mm,'This certificate is valid only for the membership period shown above.')
+    # Footer authorization zone. The three assets are constrained inside the frame.
+    footer_bottom=23*mm; footer_top=65*mm
+    c.setStrokeColorRGB(*colors['border']); c.setLineWidth(.7); c.line(27*mm,footer_top,w-27*mm,footer_top)
+    _draw_qr(c,certificate_verification_url(certificate_no),29*mm,footer_bottom+2*mm,27*mm)
+    c.setFillColorRGB(*colors['blue']); c.setFont('Helvetica-Bold',7.2)
+    c.drawCentredString(42.5*mm,footer_bottom,'SCAN TO VERIFY')
+    _draw_signature(c,86*mm,footer_bottom+7*mm,52*mm,19*mm)
+    c.setFillColorRGB(*colors['blue']); c.setFont('Helvetica-Bold',7.5)
+    c.drawCentredString(112*mm,footer_bottom+4*mm,'AUTHORIZED SIGNATURE')
+    c.setFillColorRGB(*colors['text']); c.setFont('Helvetica',6.6)
+    c.drawCentredString(112*mm,footer_bottom-1*mm,'For and on behalf of GLDC')
+    # Stamp is 35mm (~132px at 96dpi), safely below the requested 180px maximum.
+    _draw_digital_stamp(c,157*mm,footer_bottom+2*mm,35*mm,35*mm)
+    c.setFillColorRGB(*colors['text']); c.setFont('Helvetica',6.8)
+    c.drawCentredString(w/2,15*mm,'This certificate is valid only for the membership period shown above.')
     c.save(); return buf.getvalue()
 
 def email_template_render(name, variables):
