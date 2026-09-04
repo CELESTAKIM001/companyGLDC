@@ -1,4 +1,5 @@
-import os, re, json, base64, hashlib, secrets, smtplib, time
+import os, re, json, base64, hashlib, secrets, smtplib, time, socket
+from urllib.parse import urlsplit, urlunsplit
 from datetime import datetime, timedelta, timezone, date
 from functools import wraps
 from email.message import EmailMessage
@@ -171,10 +172,20 @@ def bootstrap_admin():
 
 
 def send_email(to, subject, text, html=None, attachments=None):
-    host=env('SMTP_HOST'); user=env('SMTP_USER','GMAIL_USER'); password=env('SMTP_PASSWORD','GMAIL_APP_PASSWORD')
+    # SMTP delivery is deliberately strict: return only after the SMTP server has
+    # accepted the message. This prevents the admin UI from reporting success when
+    # email configuration/connection/authentication actually failed.
+    to=str(to or '').strip()
+    if not re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+', to):
+        raise RuntimeError('EMAIL_RECIPIENT_INVALID')
+    host=str(env('SMTP_HOST', default='')).strip()
+    user=str(env('SMTP_USER','GMAIL_USER', default='')).strip()
+    password=str(env('SMTP_PASSWORD','GMAIL_APP_PASSWORD', default=''))
     if not host: raise RuntimeError('SMTP_NOT_CONFIGURED')
-    msg=EmailMessage();
-    from_name=str(env('EMAIL_FROM_NAME', default='GLDC')); from_address=str(env('EMAIL_FROM_ADDRESS', default='')).strip()
+    if not user or not password: raise RuntimeError('SMTP_CREDENTIALS_MISSING')
+    msg=EmailMessage()
+    from_name=str(env('EMAIL_FROM_NAME', default='GLDC')).strip() or 'GLDC'
+    from_address=str(env('EMAIL_FROM_ADDRESS', default='')).strip()
     smtp_from=str(env('SMTP_FROM', default='')).strip()
     if not from_address and smtp_from:
         m=re.match(r'^\s*(.*?)\s*<([^<>]+)>\s*$', smtp_from)
@@ -182,21 +193,38 @@ def send_email(to, subject, text, html=None, attachments=None):
             from_name=(m.group(1).strip() or from_name); from_address=m.group(2).strip()
         else:
             from_address=smtp_from
-    if not from_address: from_address=user or ''
-    msg['From']=f'{from_name} <{from_address}>' if from_address else user; msg['To']=to; msg['Subject']=subject
-    reply_to=env('EMAIL_REPLY_TO','SMTP_REPLY_TO');
+    if not from_address: from_address=user
+    if not re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+', from_address):
+        raise RuntimeError('SMTP_FROM_INVALID')
+    msg['From']=f'{from_name} <{from_address}>'; msg['To']=to; msg['Subject']=str(subject or '')
+    reply_to=str(env('EMAIL_REPLY_TO','SMTP_REPLY_TO', default='')).strip()
     if reply_to: msg['Reply-To']=reply_to
-    msg.set_content(text)
-    if html: msg.add_alternative(html, subtype='html')
+    msg.set_content(str(text or ''))
+    if html: msg.add_alternative(str(html), subtype='html')
     for filename, data, mimetype in attachments or []:
-        maintype, subtype = mimetype.split('/', 1)
-        msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=filename)
-    port=int(env('SMTP_PORT', default='587')); secure=env_bool('SMTP_SECURE', default=False)
-    if secure:
-        with smtplib.SMTP_SSL(host,port) as s: s.login(user,password); s.send_message(msg)
-    else:
-        with smtplib.SMTP(host,port) as s:
-            s.ehlo(); s.starttls(); s.ehlo(); s.login(user,password); s.send_message(msg)
+        maintype, subtype = str(mimetype).split('/', 1)
+        msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=str(filename))
+    port=int(env('SMTP_PORT', default='587'))
+    secure=env_bool('SMTP_SECURE', default=(port == 465))
+    timeout=int(env('SMTP_TIMEOUT_SECONDS', default='25'))
+    try:
+        if secure or port == 465:
+            with smtplib.SMTP_SSL(host,port,timeout=timeout) as s:
+                s.ehlo(); s.login(user,password); s.send_message(msg)
+        else:
+            with smtplib.SMTP(host,port,timeout=timeout) as s:
+                s.ehlo()
+                s.starttls()
+                s.ehlo()
+                s.login(user,password)
+                s.send_message(msg)
+    except smtplib.SMTPAuthenticationError as e:
+        raise RuntimeError('SMTP_AUTH_FAILED') from e
+    except smtplib.SMTPConnectError as e:
+        raise RuntimeError('SMTP_CONNECTION_FAILED') from e
+    except (smtplib.SMTPException, OSError, TimeoutError) as e:
+        raise RuntimeError('SMTP_DELIVERY_FAILED') from e
+    return True
 
 
 def _company_profile():
@@ -624,6 +652,47 @@ def normalize_mpesa_phone(phone):
         raise RuntimeError('INVALID_MPESA_PHONE:Use a Kenyan mobile number such as 0712345678 or +254712345678.')
     return raw
 
+def daraja_callback_url(validate=True):
+    """Return ONE canonical public callback URL used by every STK request.
+
+    DARAJA_CALLBACK_URL is optional: when omitted, APP_URL +
+    /api/payments/callback is used. A root website URL is also accepted and
+    automatically receives the callback path. We deliberately never accept a
+    callback supplied by a browser/admin form, so member, public and admin
+    payments all report to the same server endpoint.
+    """
+    raw=str(env('DARAJA_CALLBACK_URL', default='')).strip()
+    if not raw:
+        raw=str(APP_URL).strip() + '/api/payments/callback'
+    parts=urlsplit(raw)
+    if not parts.scheme or not parts.netloc:
+        raise RuntimeError('DARAJA_CALLBACK_INVALID: DARAJA_CALLBACK_URL must be a full HTTPS URL, e.g. https://yourdomain.co.ke/api/payments/callback.')
+    if parts.scheme.lower() != 'https':
+        raise RuntimeError('DARAJA_CALLBACK_INVALID: Daraja requires an HTTPS public callback URL.')
+    host=(parts.hostname or '').lower().rstrip('.')
+    if host in {'localhost','127.0.0.1','0.0.0.0','::1'} or host.endswith('.local') or host.endswith('.localhost'):
+        raise RuntimeError('DARAJA_CALLBACK_INVALID: The callback host must be publicly reachable; localhost/private hosts are not allowed.')
+    # A URL supplied as the website root is convenient in Vercel/hosting envs.
+    path=parts.path.rstrip('/')
+    if not path or path == '':
+        path='/api/payments/callback'
+    elif path != '/api/payments/callback':
+        # Accept a configured custom callback path only when explicitly enabled.
+        # The default route remains canonical and is what all application flows use.
+        if not env_bool('DARAJA_ALLOW_CUSTOM_CALLBACK_PATH', default=False):
+            raise RuntimeError('DARAJA_CALLBACK_INVALID: Use https://yourdomain/api/payments/callback, or explicitly enable DARAJA_ALLOW_CUSTOM_CALLBACK_PATH for a custom callback route.')
+    # Query strings/fragments can cause Daraja validation failures and are not
+    # needed for routing because payment IDs are matched from CheckoutRequestID.
+    if parts.query or parts.fragment:
+        raise RuntimeError('DARAJA_CALLBACK_INVALID: Remove query strings and fragments from DARAJA_CALLBACK_URL.')
+    canonical=urlunsplit(('https',parts.netloc,path,'','')).rstrip('/')
+    if validate and env_bool('DARAJA_CALLBACK_REACHABILITY_CHECK', default=True):
+        # Do not fail a payment because an internal server cannot loop back to
+        # itself; this is only a fast diagnostic when the URL is externally
+        # configured. The actual Daraja request remains the source of truth.
+        pass
+    return canonical
+
 def daraja_token():
     base='https://api.safaricom.co.ke' if str(env('DARAJA_ENV','DARAJA_ENVIRONMENT', default='production')).lower()=='production' else 'https://sandbox.safaricom.co.ke'
     key=str(env('DARAJA_CONSUMER_KEY', default=''))
@@ -653,8 +722,7 @@ def daraja_stk(phone,amount,reference,description):
         raise RuntimeError('DARAJA_CONFIG_MISSING:Configure DARAJA_TILL_NUMBER for CustomerBuyGoodsOnline.')
     base,access=daraja_token(); ts=datetime.now().strftime('%Y%m%d%H%M%S')
     password=base64.b64encode(f'{short}{passkey}{ts}'.encode()).decode()
-    callback=str(env('DARAJA_CALLBACK_URL', default=APP_URL + '/api/payments/callback')).strip().rstrip('/')
-    if not callback.endswith('/api/payments/callback'): callback += '/api/payments/callback'
+    callback=daraja_callback_url()
     # IMPORTANT: PartyA is the customer's phone, not the business shortcode.
     body={'BusinessShortCode':short,'Password':password,'Timestamp':ts,'TransactionType':transaction_type,'Amount':amount,'PartyA':customer,'PartyB':till or short,'PhoneNumber':customer,'CallBackURL':callback,'AccountReference':str(reference)[:12],'TransactionDesc':str(description)[:13]}
     r=requests.post(base+'/mpesa/stkpush/v1/processrequest',headers={'Authorization':'Bearer '+access,'Content-Type':'application/json'},json=body,timeout=30)
@@ -699,7 +767,6 @@ def validate_production_config():
             ('DARAJA_SHORTCODE', 'DARAJA_PARTY_A_SHORTCODE'),
             ('DARAJA_TILL_NUMBER', 'DARAJA_PARTY_B_BUYGOODS_TILL', 'DARAJA_BUYGOODS_TILL'),
             ('DARAJA_PASSKEY',),
-            ('DARAJA_CALLBACK_URL',),
         ]
         for group in daraja_groups:
             if not any(env(k) for k in group):
@@ -1208,6 +1275,31 @@ def api_stk():
     except Exception as e:
         db.payments.update_one({'id':pid},{'$set':{'status':'FAILED','error':'Daraja request failed','updatedAt':now()}}); return json_error(str(e),500)
 
+@app.get('/api/payments/<payment_id>/status')
+@login_required
+def api_payment_status(payment_id):
+    p=db.payments.find_one({'id':payment_id},{'_id':0})
+    if not p: return json_error('Payment not found.',404,'PAYMENT_NOT_FOUND')
+    u=current_user()
+    allowed=u.get('role') in {'ADMIN','SUPER ADMIN / OWNER'} or (p.get('memberId') and p.get('memberId')==u.get('memberId')) or (p.get('email') and str(p.get('email')).lower()==str(u.get('email')).lower())
+    if not allowed: return json_error('You are not allowed to view this payment.',403,'PAYMENT_FORBIDDEN')
+    status=str(p.get('status','PENDING')).upper()
+    if status=='SUCCESSFUL': message='Payment successful. Thank you.'
+    elif status=='CANCELLED': message='User cancelled the M-Pesa transaction. You can try again.'
+    elif status=='FAILED': message='Payment failed. Please recheck the details and try again.'
+    elif status=='PENDING_ADMIN_VERIFICATION': message='Payment details were submitted and are awaiting verification.'
+    else: message='Payment prompt is still pending. Approve it on the phone, or wait for the result.'
+    return jsonify(ok=True,payment={'id':p.get('id'),'status':status,'message':message,'resultCode':p.get('resultCode'),'resultDescription':p.get('resultDescription'),'mpesaReceiptNumber':p.get('mpesaReceiptNumber'),'receiptCode':p.get('receiptCode'),'amount':p.get('amount'),'reference':p.get('reference'),'updatedAt':p.get('updatedAt')})
+
+@app.get('/api/payments/callback')
+def api_callback_probe():
+    # Public, unauthenticated probe. Daraja may validate the callback URL before
+    # accepting an STK request, so this route must be reachable without CSRF/auth.
+    try:
+        return jsonify(ok=True, service='gldc-mpesa-callback', status='READY'), 200
+    except Exception:
+        return Response('{\"ok\":true}', status=200, mimetype='application/json')
+
 @app.post('/api/payments/callback')
 def api_callback():
     try:
@@ -1215,18 +1307,38 @@ def api_callback():
         if not cb: return jsonify(ResultCode=0,ResultDesc='Accepted')
         items=cb.get('CallbackMetadata',{}).get('Item',[]); vals={i.get('Name'):i.get('Value') for i in items}; checkout=cb.get('CheckoutRequestID'); p=db.payments.find_one({'checkoutRequestId':checkout,'status':'PENDING'})
         if not p: return jsonify(ResultCode=0,ResultDesc='Accepted')
-        success=int(cb.get('ResultCode',1))==0; update={'status':'SUCCESSFUL' if success else 'FAILED','resultCode':cb.get('ResultCode'),'resultDescription':cb.get('ResultDesc'),'updatedAt':now()}
+        result_code=cb.get('ResultCode')
+        result_desc=str(cb.get('ResultDesc') or '').strip()
+        try: result_code_int=int(result_code)
+        except Exception: result_code_int=1
+        success=result_code_int==0
+        cancelled=(not success) and (result_code_int==1032 or 'cancel' in result_desc.lower())
+        final_status='SUCCESSFUL' if success else ('CANCELLED' if cancelled else 'FAILED')
+        update={'status':final_status,'resultCode':result_code,'resultDescription':result_desc,'updatedAt':now()}
         if success: update.update({'mpesaReceiptNumber':vals.get('MpesaReceiptNumber'),'transactionDate':vals.get('TransactionDate'),'phoneNumber':vals.get('PhoneNumber'),'amount':vals.get('Amount')})
-        db.payments.update_one({'_id':p['_id']},{'$set':update}); db.audit.insert_one({'action':'PAYMENT_SUCCESS' if success else 'PAYMENT_FAILED','entity':p['id'],'createdAt':now(),'result':cb.get('ResultDesc')})
-        if success and p.get('memberId'):
+        else: update['userMessage']='You cancelled the M-Pesa transaction.' if cancelled else 'Payment failed. Please recheck the details and try again.'
+        db.payments.update_one({'_id':p['_id']},{'$set':update}); db.audit.insert_one({'action':'PAYMENT_SUCCESS' if success else ('PAYMENT_CANCELLED' if cancelled else 'PAYMENT_FAILED'),'entity':p['id'],'createdAt':now(),'result':result_desc})
+        if p.get('memberId'):
             m=db.members.find_one({'id':p.get('memberId')}); plan=db.membership_plans.find_one({'id':p.get('planId')})
             if m:
-                db.members.update_one({'_id':m['_id']},{'$set':{'status':'PENDING_REVIEW','paymentId':p['id'],'paymentReceiptCode':p.get('receiptCode'),'updatedAt':now()}})
-                if p.get('renewalId'): db.membership_renewals.update_one({'id':p['renewalId']},{'$set':{'status':'PENDING_REVIEW','paidAt':now(),'updatedAt':now()}})
-                p.update(update)
-                try:
-                    receipt=build_receipt_pdf(p,m); _send_member_email('membership_payment_receipt',m,{'name':m.get('name',''),'plan':p.get('planName',''),'amount':p.get('amount'),'receiptCode':p.get('receiptCode'),'subject':'GLDC Membership Payment Receipt','text':f'We received your membership payment. Receipt: {p.get("receiptCode")}.','html':f'<div style="font-family:Arial;max-width:640px;margin:auto"><h2 style="color:#8B4A18">Payment received</h2><p>Dear {m.get("name","")},</p><p>Your payment for <b>{p.get("planName","")}</b> has been received and your application is now awaiting GLDC review.</p><p><b>Receipt:</b> {p.get("receiptCode")}<br><b>Amount:</b> KES {float(p.get("amount",0)):,.2f}</p><p>Your payment receipt is attached.</p></div>'},[('GLDC-Receipt-'+str(p.get('receiptCode'))+'.pdf',receipt,'application/pdf')])
-                except Exception: app.logger.exception('Membership receipt email failed')
+                if success:
+                    db.members.update_one({'_id':m['_id']},{'$set':{'status':'PENDING_REVIEW','paymentId':p['id'],'paymentReceiptCode':p.get('receiptCode'),'updatedAt':now()}})
+                    if p.get('renewalId'): db.membership_renewals.update_one({'id':p['renewalId']},{'$set':{'status':'PENDING_REVIEW','paidAt':now(),'updatedAt':now()}})
+                    p.update(update)
+                    try:
+                        receipt=build_receipt_pdf(p,m); _send_member_email('membership_payment_receipt',m,{'name':m.get('name',''),'plan':p.get('planName',''),'amount':p.get('amount'),'receiptCode':p.get('receiptCode'),'subject':'GLDC Membership Payment Receipt','text':f'We received your membership payment. Receipt: {p.get("receiptCode")}.','html':f'<div style="font-family:Arial;max-width:640px;margin:auto"><h2 style="color:#8B4A18">Payment received</h2><p>Dear {m.get("name","")},</p><p>Your payment for <b>{p.get("planName","")}</b> has been received and your application is now awaiting GLDC review.</p><p><b>Receipt:</b> {p.get("receiptCode")}<br><b>Amount:</b> KES {float(p.get("amount",0)):,.2f}</p><p>Your payment receipt is attached.</p></div>'},[('GLDC-Receipt-'+str(p.get('receiptCode'))+'.pdf',receipt,'application/pdf')])
+                    except Exception: app.logger.exception('Membership receipt email failed')
+                else:
+                    failed_member_status='PAYMENT_FAILED'
+                    db.members.update_one({'_id':m['_id']},{'$set':{'status':failed_member_status,'paymentId':p['id'],'updatedAt':now()}})
+                    if p.get('renewalId'): db.membership_renewals.update_one({'id':p['renewalId']},{'$set':{'status':failed_member_status,'updatedAt':now()}})
+        elif success and p.get('email'):
+            # Generic/admin prompts can also notify the payer and provide the official receipt.
+            p.update(update)
+            try:
+                receipt=build_receipt_pdf(p,None)
+                send_email(p['email'],f'GLDC Payment Receipt {p.get("receiptCode")}',f'Your GLDC payment was received successfully. Receipt: {p.get("receiptCode")}.',f'<p>Your GLDC payment was received successfully.</p><p><b>Amount:</b> KES {float(p.get("amount",0)):,.2f}<br><b>Reference:</b> {p.get("reference") or p.get("receiptCode")}</p><p>Receipt: <b>{p.get("receiptCode")}</b></p>',[(f'GLDC-Receipt-{p.get("receiptCode")}.pdf',receipt,'application/pdf')])
+            except Exception: app.logger.exception('Generic payment receipt email failed')
         return jsonify(ResultCode=0,ResultDesc='Accepted')
     except Exception: return jsonify(ResultCode=0,ResultDesc='Accepted')
 
@@ -1257,7 +1369,21 @@ def _member_doc():
 
 def _member_public(m):
     if not m: return None
-    return {k:clean_doc(m).get(k) for k in ['id','membershipNumber','name','profileSlug','bio','profession','company','location','phone','email','status','membershipPlan','validFrom','validUntil','photoDriveId']}
+    # Public member profiles must be view-only and must never expose private contact
+    # fields such as email/phone. Only approved public-profile information is returned.
+    return {k:clean_doc(m).get(k) for k in ['id','membershipNumber','name','profileSlug','bio','profession','company','location','status','membershipPlan','validFrom','validUntil','photoDriveId','portfolioUrl']}
+
+
+PUBLIC_MEMBER_STATUSES = {'ACTIVE','EXPIRING_SOON'}
+
+def _public_member_by_slug(slug):
+    if db is None: return None
+    m=db.members.find_one({'profileSlug':str(slug).strip()})
+    if not m: return None
+    m=sync_membership_state(m)
+    if str(m.get('status','')).upper() not in PUBLIC_MEMBER_STATUSES:
+        return None
+    return m
 
 def _send_member_email(kind, member, variables, attachments=None):
     rendered=email_template_render(kind,variables)
@@ -1368,6 +1494,32 @@ def cron_check_abandoned_registrations():
         _notify_admin_member_abandoned(entry)
     return jsonify(ok=True, checked=len(entries), notified=len(entries))
 
+@app.get('/api/admin/daraja/callback-check')
+@admin_required
+def admin_daraja_callback_check():
+    """Validate and probe the single callback URL used by every STK flow."""
+    try:
+        callback=daraja_callback_url(validate=True)
+        result={'url':callback,'formatValid':True,'publicProbe':False}
+        try:
+            r=requests.get(callback,headers={'User-Agent':'GLDC-Daraja-Callback-Check/1.0','Accept':'application/json'},timeout=8,allow_redirects=False)
+            result['httpStatus']=r.status_code
+            result['publicProbe']=r.status_code==200
+            if r.status_code==200:
+                result['message']='Callback URL is public, HTTPS and returned HTTP 200. It is ready for Daraja callbacks.'
+            elif 300 <= r.status_code < 400:
+                result['message']=f'Callback URL redirected with HTTP {r.status_code}. Use the final HTTPS URL directly; Daraja callbacks should not require redirects.'
+            else:
+                result['message']=f'Callback URL returned HTTP {r.status_code}. It must be publicly reachable and return HTTP 200 without authentication.'
+        except Exception as probe_error:
+            result['probeError']=str(probe_error)
+            result['message']='The URL format is valid, but this server could not prove external reachability. Ensure the URL is public HTTPS, has no login/CSRF protection, and returns HTTP 200.'
+        return jsonify(ok=True,daraja=result)
+    except RuntimeError as e:
+        return json_error(str(e),422,'DARAJA_CALLBACK_INVALID')
+    except Exception as e:
+        return json_error('Callback check failed: '+str(e),500,'DARAJA_CALLBACK_CHECK_FAILED')
+
 @app.get('/api/admin/daraja/test')
 @admin_required
 def admin_daraja_test():
@@ -1380,13 +1532,19 @@ def admin_daraja_test():
         'DARAJA_SHORTCODE': ('DARAJA_SHORTCODE','DARAJA_PARTY_A_SHORTCODE'),
         'DARAJA_TILL_NUMBER': ('DARAJA_TILL_NUMBER','DARAJA_PARTY_B_BUYGOODS_TILL','DARAJA_BUYGOODS_TILL'),
         'DARAJA_PASSKEY': ('DARAJA_PASSKEY',),
-        'DARAJA_CALLBACK_URL': ('DARAJA_CALLBACK_URL',),
     }
     missing = [name for name, aliases in groups.items() if not any(env(k) for k in aliases)]
+    callback_error=None
+    try:
+        callback_url=daraja_callback_url(validate=True)
+    except Exception as e:
+        callback_url=''
+        callback_error=str(e)
     result = {
         'darajaEnabled': env_bool('DARAJA_ENABLED', default=True),
         'darajaEnvironment': str(env('DARAJA_ENV','DARAJA_ENVIRONMENT', default='production')),
-        'callbackUrl': str(env('DARAJA_CALLBACK_URL', default=APP_URL + '/api/payments/callback')),
+        'callbackUrl': callback_url,
+        'callbackError': callback_error,
         'missingConfig': missing,
         'oauth': None,
     }
@@ -1573,6 +1731,11 @@ def member_dashboard():
     if not _member_session(): return redirect('/member/login')
     return render_template('member_dashboard.html',title='Member Portal')
 
+@app.route('/member/renew')
+def member_renew_page():
+    if not _member_session(): return redirect('/member/login?next=/member/renew')
+    return render_template('member_renew.html',title='Renew Membership')
+
 @app.route('/member/profile')
 def member_profile_dashboard():
     if not _member_session(): return redirect('/member/login?next=/member/profile')
@@ -1611,6 +1774,25 @@ def membership_certificate_verify_api(certificate_no):
     if not c: return json_error('Certificate not found.',404,'CERTIFICATE_NOT_FOUND')
     return jsonify(ok=True,certificate=clean_doc(c))
 
+@app.post('/api/member/certificates/<certificate_no>/send-email')
+def member_send_membership_certificate(certificate_no):
+    m=_member_doc()
+    if not m: return json_error('Please sign in to your member portal.',401,'AUTH_REQUIRED')
+    c=db.membership_certificates.find_one({'certificateNumber':certificate_no,'memberId':m.get('id')})
+    if not c: return json_error('Certificate not found.',404,'CERTIFICATE_NOT_FOUND')
+    recipient=str(m.get('email') or '').strip().lower()
+    if '@' not in recipient: return json_error('Your member account has no valid email address.',422,'EMAIL_RECIPIENT_INVALID')
+    plan=_membership_plan(c.get('planId','')) or {'id':c.get('planId'),'name':c.get('planName','GLDC Membership'),'months':1}
+    try:
+        subject,text,html,pdf,verify_url=_certificate_email_payload(c,m,plan)
+        send_email(recipient,subject,text,html,[('GLDC-'+certificate_no+'.pdf',pdf,'application/pdf')])
+        db.email_deliveries.insert_one({'id':make_id('MAIL'),'type':'MEMBERSHIP_CERTIFICATE_SELF_RESEND','memberId':m.get('id'),'certificateNumber':certificate_no,'to':recipient,'subject':subject,'status':'SMTP_ACCEPTED','sentAt':now(),'verificationUrl':verify_url})
+        audit('MEMBERSHIP_CERTIFICATE_SELF_SENT','certificate',certificate_no,{'memberId':m.get('id'),'recipient':recipient})
+        return jsonify(ok=True,message='Certificate email accepted by SMTP.',recipient=recipient,verificationUrl=verify_url)
+    except Exception as exc:
+        app.logger.exception('Member certificate email failed cert=%s recipient=%s',certificate_no,recipient)
+        return json_error(str(exc),503,'CERTIFICATE_EMAIL_FAILED')
+
 @app.get('/api/member/certificates/<certificate_no>/download')
 def member_certificate_history_download(certificate_no):
     m=_member_doc(); c=db.membership_certificates.find_one({'certificateNumber':certificate_no,'memberId':m.get('id')}) if m else None
@@ -1636,14 +1818,21 @@ def members_directory():
 @app.get('/api/members')
 def public_members():
     try:
-        rows=db.members.find({'status':{'$in':['ACTIVE','EXPIRING_SOON']}},{'_id':0,'id':1,'name':1,'profileSlug':1,'profession':1,'company':1,'location':1,'photoDriveId':1}).sort('name',ASCENDING)
-        return jsonify(ok=True,members=[clean_doc(x) for x in rows])
+        rows=[]
+        for x in db.members.find({}, {'_id':0,'id':1,'name':1,'profileSlug':1,'profession':1,'company':1,'location':1,'photoDriveId':1,'status':1,'validUntil':1}).sort('name',ASCENDING).limit(500):
+            x=sync_membership_state(x)
+            if str(x.get('status','')).upper() not in PUBLIC_MEMBER_STATUSES: continue
+            rows.append(clean_doc(x))
+        return jsonify(ok=True,members=rows)
     except Exception:
         return json_error('The member directory is temporarily unavailable.',503,'MEMBER_DIRECTORY_UNAVAILABLE')
 
 @app.route('/members/<slug>')
 def member_profile(slug):
-    m=db.members.find_one({'profileSlug':slug,'status':'ACTIVE'}) if db is not None else None
+    # Public, read-only profile. A member may view another approved member without
+    # entering edit mode or having that member's credentials. Expiring-soon members
+    # remain publicly discoverable until the membership actually expires.
+    m=_public_member_by_slug(slug)
     if not m: return render_template('404.html',title='Member not found'),404
     return render_template('member_profile.html',title=m.get('name','GLDC Member'),member=_member_public(m))
 
@@ -1953,14 +2142,37 @@ def admin_membership_request_action():
         db.notifications.insert_one({'id':make_id('NOT'),'memberId':m['id'],'title':'GLDC action required','message':message,'type':'MEMBERSHIP','audience':'MEMBER','createdAt':now()})
         variables={'name':m.get('name',''),'message':message,'editUrl':edit_url,'requestedFields':field_text,'deadline':deadline or 'As soon as possible','subject':'GLDC Membership – action required','text':f'Dear {m.get("name","")},\n\n{message}\n\nRequested fields: {field_text}\nDeadline: {deadline or "As soon as possible"}\n\nUpdate your details here: {edit_url}'}
         rendered=email_template_render('membership_action_request',variables)
-        if rendered: send_email(m['email'],rendered[0],rendered[1],rendered[2])
-        else: send_email(m['email'],variables['subject'],variables['text'],f'<div style="font-family:Arial;max-width:640px;margin:auto"><h2 style="color:#8B4A18">GLDC Membership – action required</h2><p>Dear <b>{m.get("name","")}</b>,</p><p>{message}</p>{due}<p><a href="{edit_url}" style="background:#8B4A18;color:#fff;padding:12px 18px;text-decoration:none">OPEN MEMBER PORTAL</a></p></div>')
-        audit('MEMBERSHIP_ACTION_REQUESTED','member',member_id,{'fields':fields,'deadline':deadline})
-        return jsonify(ok=True,message='Member action request emailed successfully.')
+        if rendered:
+            send_email(m['email'],rendered[0],rendered[1],rendered[2])
+        else:
+            fallback_html = (
+                '<div style="font-family:Arial;max-width:640px;margin:auto">'
+                '<h2 style="color:#8B4A18">GLDC Membership – action required</h2>'
+                f'<p>Dear <b>{m.get("name", "")}</b>,</p><p>{message}</p>{due}'
+                f'<p><a href="{edit_url}" style="background:#8B4A18;color:#fff;padding:12px 18px;text-decoration:none">OPEN MEMBER PORTAL</a></p>'
+                '</div>'
+            )
+            send_email(m['email'],variables['subject'],variables['text'],fallback_html)
+        sent_at=now()
+        db.email_deliveries.insert_one({'id':make_id('MAIL'),'type':'MEMBERSHIP_ACTION_REQUEST','memberId':member_id,'to':m['email'],'subject':variables['subject'],'status':'SMTP_ACCEPTED','sentAt':sent_at})
+        audit('MEMBERSHIP_ACTION_REQUESTED','member',member_id,{'fields':fields,'deadline':deadline,'emailStatus':'SMTP_ACCEPTED','email':m['email']})
+        return jsonify(ok=True,message='Email accepted by the configured SMTP server.',emailStatus='SMTP_ACCEPTED',recipient=m['email'],sentAt=sent_at.isoformat())
     except Exception as e:
         app.logger.exception('Membership action email failed')
-        if 'SMTP' in str(e).upper(): return json_error('The member details were saved, but the email could not be sent because email delivery is not configured or available.',503,'EMAIL_SEND_FAILED')
-        return json_error('We could not send the member action request right now.',503,'MEMBER_ACTION_EMAIL_FAILED')
+        try:
+            db.email_deliveries.insert_one({'id':make_id('MAIL'),'type':'MEMBERSHIP_ACTION_REQUEST','memberId':locals().get('member_id'),'to':locals().get('m',{}).get('email'),'subject':locals().get('variables',{}).get('subject','GLDC Membership – action required'),'status':'FAILED','error':str(e),'createdAt':now()})
+        except Exception:
+            app.logger.exception('Could not record failed email delivery')
+        code=str(e).upper()
+        if code=='SMTP_NOT_CONFIGURED': msg='Email was NOT sent: SMTP_HOST is not configured.'
+        elif code=='SMTP_CREDENTIALS_MISSING': msg='Email was NOT sent: SMTP username/password is missing.'
+        elif code=='SMTP_AUTH_FAILED': msg='Email was NOT sent: SMTP authentication failed. Check the SMTP username/password or app password.'
+        elif code=='SMTP_CONNECTION_FAILED': msg='Email was NOT sent: could not connect to the SMTP server. Check SMTP host/port/firewall.'
+        elif code=='SMTP_DELIVERY_FAILED': msg='Email was NOT sent: the SMTP server rejected or could not deliver the message. Check the server logs/provider settings.'
+        elif code=='SMTP_FROM_INVALID': msg='Email was NOT sent: SMTP_FROM/EMAIL_FROM_ADDRESS is invalid.'
+        elif code=='EMAIL_RECIPIENT_INVALID': msg='Email was NOT sent: the member has an invalid email address.'
+        else: msg='We could not send the member action request right now. Check the server email logs.'
+        return json_error(msg,503,'EMAIL_SEND_FAILED')
 
 @app.post('/api/admin/membership/payments/<payment_id>/verify')
 @admin_required
@@ -2072,6 +2284,39 @@ def admin_members_v14():
         out.append(clean_doc(x))
     return jsonify(ok=True,members=out)
 
+def _certificate_email_payload(cert, member, plan):
+    cert_no=cert.get('certificateNumber')
+    verify_url=f"{APP_URL.rstrip('/')}/membership/certificate/{cert_no}"
+    pdf=None
+    drive_id=cert.get('driveFileId')
+    if drive_id:
+        try:
+            pdf=drive_download_bytes_by_id(drive_id)
+        except Exception:
+            app.logger.exception('Certificate Drive read failed cert=%s', cert_no)
+    if not pdf or not bytes(pdf).startswith(b'%PDF-'):
+        pdf=build_membership_certificate(member, plan, cert_no, cert.get('validFrom'), cert.get('validUntil'), cert.get('issuedAt'))
+    name=member.get('name','GLDC Member')
+    subject=f"Your GLDC Membership Certificate – {cert_no}"
+    text=(f"Dear {name},\n\nYour GLDC membership certificate {cert_no} is attached.\n"
+          f"Membership No: {cert.get('membershipNumber','')}\n"
+          f"Plan: {cert.get('planName','')}\n"
+          f"Valid: {str(cert.get('validFrom',''))[:10]} to {str(cert.get('validUntil',''))[:10]}\n\n"
+          f"Verify the certificate using the QR code on the PDF or this official GLDC verification page:\n{verify_url}\n\nGLDC")
+    html=(f'<div style="font-family:Arial;max-width:680px;margin:auto">'
+          f'<div style="padding:22px;background:#8B4A18;color:#fff"><h2 style="margin:0">GLDC Membership Certificate</h2></div>'
+          f'<div style="padding:24px"><p>Dear <b>{name}</b>,</p>'
+          f'<p>Your official GLDC membership certificate is attached to this email.</p>'
+          f'<p><b>Membership No:</b> {cert.get("membershipNumber","")}<br>'
+          f'<b>Plan:</b> {cert.get("planName","")}<br>'
+          f'<b>Valid:</b> {str(cert.get("validFrom",""))[:10]} to {str(cert.get("validUntil",""))[:10]}<br>'
+          f'<b>Certificate:</b> {cert_no}</p>'
+          f'<p><b>Certificate verification:</b> Scan the QR code printed on the certificate, or '
+          f'<a href="{verify_url}">open the official GLDC verification page</a>.</p>'
+          f'<p style="font-size:12px;color:#666">The QR code opens a GLDC database-backed verification record for this specific certificate and membership period.</p>'
+          f'</div></div>')
+    return subject,text,html,pdf,verify_url
+
 @app.post('/api/admin/members/<member_id>/decision')
 @admin_required
 def admin_member_decision(member_id):
@@ -2098,19 +2343,50 @@ def admin_member_decision(member_id):
         db.members.update_one({'_id':m['_id']},{'$set':update}); m.update(update)
         if is_renewal and old_certificate_number:
             db.membership_certificates.update_one({'certificateNumber':old_certificate_number,'memberId':m['id']},{'$set':{'status':'EXPIRED','expiredAt':issue_date,'updatedAt':issue_date}})
-        cert_doc={'id':make_id('CERT'),'certificateNumber':cert,'memberId':m['id'],'membershipNumber':number,'memberName':m.get('name',''),'planId':plan['id'],'planName':plan['name'],'validFrom':from_date,'validUntil':valid,'issuedAt':issue_date,'status':'ACTIVE','replacesCertificateNumber':old_certificate_number if is_renewal else None,'createdAt':issue_date}
+        cert_doc={'id':make_id('CERT'),'certificateNumber':cert,'memberId':m['id'],'membershipNumber':number,'memberName':m.get('name',''),'planId':plan['id'],'planName':plan['name'],'validFrom':from_date,'validUntil':valid,'issuedAt':issue_date,'status':'ACTIVE','replacesCertificateNumber':old_certificate_number if is_renewal else None,'verificationUrl':f"{APP_URL.rstrip('/')}/membership/certificate/{cert}",'createdAt':issue_date}
         pdf=build_membership_certificate(m,plan,cert,from_date,valid,issue_date)
         try:
             drive=drive_upload_bytes(f'{cert}.pdf',pdf,'application/pdf'); cert_doc['driveFileId']=drive.get('id'); db.members.update_one({'_id':m['_id']},{'$set':{'certificateDriveId':drive.get('id')}})
         except Exception: app.logger.exception('Certificate Drive archive failed')
         db.membership_certificates.insert_one(cert_doc)
         if is_renewal and m.get('paymentId'): db.membership_renewals.update_one({'paymentId':m.get('paymentId')},{'$set':{'status':'APPROVED','certificateNumber':cert,'validFrom':from_date,'validUntil':valid,'approvedAt':issue_date,'approvedBy':current_user().get('email'),'updatedAt':issue_date}})
-        _send_member_email('membership_certificate',m,{'name':m['name'],'membershipNumber':number,'plan':plan['name'],'validUntil':str(valid)[:10],'certificateNumber':cert,'subject':'Your GLDC Membership Certificate','text':f'Your GLDC membership has been approved. Certificate {cert}.','html':f'<div style="font-family:Arial;max-width:640px;margin:auto"><h2 style="color:#8B4A18">Membership Approved</h2><p>Dear {m["name"]},</p><p>Your {"renewal" if is_renewal else "membership"} has been approved.</p><p><b>Membership No:</b> {number}<br><b>Plan:</b> {plan["name"]}<br><b>Valid:</b> {str(from_date)[:10]} to {str(valid)[:10]}<br><b>Certificate:</b> {cert}</p></div>'},[('GLDC-'+cert+'.pdf',pdf,'application/pdf')])
+        
+        subject,text,html,cert_pdf,verify_url=_certificate_email_payload(cert_doc,m,plan)
+        try:
+            send_email(m['email'],subject,text,html,[('GLDC-'+cert+'.pdf',cert_pdf,'application/pdf')])
+            db.email_deliveries.insert_one({'id':make_id('MAIL'),'type':'MEMBERSHIP_CERTIFICATE','memberId':m['id'],'certificateNumber':cert,'to':m['email'],'subject':subject,'status':'SMTP_ACCEPTED','sentAt':now(),'verificationUrl':verify_url})
+        except Exception as email_exc:
+            app.logger.exception('Certificate approval email failed cert=%s member=%s',cert,m.get('id'))
+            db.email_deliveries.insert_one({'id':make_id('MAIL'),'type':'MEMBERSHIP_CERTIFICATE','memberId':m['id'],'certificateNumber':cert,'to':m.get('email',''),'subject':subject,'status':'FAILED','sentAt':now(),'error':str(email_exc),'verificationUrl':verify_url})
+            # Approval remains successful; Admin/Member can resend from the certificate workspace.
+
     else:
         status='CHANGES_REQUIRED' if decision=='REQUEST_CHANGES' else 'REJECTED'; note=str(b.get('message','Please review and update your membership details.')).strip(); db.members.update_one({'_id':m['_id']},{'$set':{'status':status,'adminMessage':note,'updatedAt':now()}})
         if m.get('paymentId') and db.payments.find_one({'id':m.get('paymentId'),'purpose':{'$in':['MEMBERSHIP_RENEWAL','MEMBERSHIP_UPGRADE']}}): db.membership_renewals.update_one({'paymentId':m.get('paymentId')},{'$set':{'status':status,'adminMessage':note,'updatedAt':now()}})
         edit_url=f'{APP_URL}/member/dashboard?edit=1'; _send_member_email('membership_changes',m,{'name':m['name'],'message':note,'editUrl':edit_url,'subject':'GLDC Membership – action required','text':f'Please review your membership details: {edit_url}','html':f'<div style="font-family:Arial;max-width:640px;margin:auto"><h2 style="color:#8B4A18">Membership details need your attention</h2><p>Dear {m["name"]},</p><p>{note}</p><p><a href="{edit_url}">EDIT MY DETAILS</a></p></div>'})
     audit('MEMBERSHIP_DECISION','member',member_id,{'decision':decision}); return jsonify(ok=True,status='ACTIVE' if decision=='APPROVE' else ('CHANGES_REQUIRED' if decision=='REQUEST_CHANGES' else 'REJECTED'))
+
+@app.post('/api/admin/membership/certificates/<certificate_no>/send')
+@admin_required
+def admin_send_membership_certificate(certificate_no):
+    b=request.get_json(silent=True) or {}
+    c=db.membership_certificates.find_one({'certificateNumber':certificate_no})
+    if not c: return json_error('Certificate not found.',404,'CERTIFICATE_NOT_FOUND')
+    m=db.members.find_one({'id':c.get('memberId')})
+    if not m: return json_error('Certificate member record not found.',404,'MEMBER_NOT_FOUND')
+    recipient=str(b.get('email') or m.get('email') or '').strip().lower()
+    if '@' not in recipient: return json_error('Enter a valid recipient email address.',422,'EMAIL_RECIPIENT_INVALID')
+    plan=_membership_plan(c.get('planId','')) or db.membership_plans.find_one({'id':c.get('planId')}) or {'id':c.get('planId'),'name':c.get('planName','GLDC Membership'),'months':1}
+    try:
+        subject,text,html,pdf,verify_url=_certificate_email_payload(c,m,plan)
+        send_email(recipient,subject,text,html,[('GLDC-'+certificate_no+'.pdf',pdf,'application/pdf')])
+        db.email_deliveries.insert_one({'id':make_id('MAIL'),'type':'MEMBERSHIP_CERTIFICATE_RESEND','memberId':m.get('id'),'certificateNumber':certificate_no,'to':recipient,'subject':subject,'status':'SMTP_ACCEPTED','sentAt':now(),'verificationUrl':verify_url,'sentBy':current_user().get('email')})
+        audit('MEMBERSHIP_CERTIFICATE_SENT','certificate',certificate_no,{'memberId':m.get('id'),'recipient':recipient})
+        return jsonify(ok=True,message='Certificate email accepted by SMTP.',recipient=recipient,certificateNumber=certificate_no,verificationUrl=verify_url)
+    except Exception as exc:
+        app.logger.exception('Certificate email failed cert=%s recipient=%s',certificate_no,recipient)
+        db.email_deliveries.insert_one({'id':make_id('MAIL'),'type':'MEMBERSHIP_CERTIFICATE_RESEND','memberId':m.get('id'),'certificateNumber':certificate_no,'to':recipient,'status':'FAILED','sentAt':now(),'error':str(exc),'sentBy':current_user().get('email')})
+        return json_error(str(exc),503,'CERTIFICATE_EMAIL_FAILED')
 
 @app.get('/api/admin/membership/recover/<receipt_code>')
 @admin_required
@@ -2126,6 +2402,35 @@ def admin_membership_renewals(): return jsonify(ok=True,renewals=list_collection
 @app.get('/api/admin/membership/certificates')
 @admin_required
 def admin_membership_certificates(): return jsonify(ok=True,certificates=list_collection('membership_certificates',500))
+
+@app.post('/api/admin/membership/test-email/<member_id>')
+@admin_required
+def admin_membership_test_email(member_id):
+    try:
+        m=db.members.find_one({'id':member_id})
+        if not m: return json_error('Member not found.',404,'MEMBER_NOT_FOUND')
+        email=str(m.get('email','')).strip().lower()
+        if not email: return json_error('This member has no email address.',422,'EMAIL_RECIPIENT_INVALID')
+        subject='GLDC email delivery test'
+        text=f'Dear {m.get("name", "Member")},\n\nThis is a test email from the GLDC Admin Portal. If you received this message, GLDC email delivery is working for your address.\n\nGLDC'
+        html=f'<div style="font-family:Arial;max-width:640px;margin:auto"><h2 style="color:#8B4A18">GLDC email delivery test</h2><p>Dear <b>{m.get("name", "Member")}</b>,</p><p>This is a test email from the GLDC Admin Portal.</p><p><b>If you received this message, email delivery is working.</b></p></div>'
+        send_email(email,subject,text,html)
+        db.email_deliveries.insert_one({'id':make_id('MAIL'),'type':'EMAIL_TEST','memberId':member_id,'to':email,'subject':subject,'status':'SMTP_ACCEPTED','sentAt':now()})
+        audit('MEMBER_EMAIL_TEST_SENT','member',member_id,{'email':email,'status':'SMTP_ACCEPTED'})
+        return jsonify(ok=True,message='Test email accepted by the configured SMTP server.',recipient=email,emailStatus='SMTP_ACCEPTED')
+    except Exception as e:
+        app.logger.exception('Member email test failed')
+        code=str(e).upper()
+        messages={
+            'SMTP_NOT_CONFIGURED':'Email was NOT sent: SMTP_HOST is not configured.',
+            'SMTP_CREDENTIALS_MISSING':'Email was NOT sent: SMTP username/password is missing.',
+            'SMTP_AUTH_FAILED':'Email was NOT sent: SMTP authentication failed. Check the SMTP username/password or app password.',
+            'SMTP_CONNECTION_FAILED':'Email was NOT sent: could not connect to the SMTP server. Check SMTP host/port/firewall.',
+            'SMTP_DELIVERY_FAILED':'Email was NOT sent: SMTP delivery failed. Check the provider/server logs.',
+            'SMTP_FROM_INVALID':'Email was NOT sent: the configured sender address is invalid.',
+            'EMAIL_RECIPIENT_INVALID':'Email was NOT sent: the member email address is invalid.'
+        }
+        return json_error(messages.get(code,'Email was NOT sent. Check the server email logs.'),503,'EMAIL_SEND_FAILED')
 
 @app.get('/api/admin/email-templates')
 @admin_required
@@ -2257,22 +2562,40 @@ def admin_create_membership_receipt():
 @app.post('/api/admin/membership/payments/prompt')
 @admin_required
 def admin_membership_payment_prompt():
+    """Send a Daraja STK prompt to any Kenyan mobile number.
+
+    Kept on the historical membership URL for backward compatibility, but the
+    payment is now a general GLDC payment and memberId is optional.
+    """
     try:
-        b=request.get_json(silent=True) or {}; member_id=str(b.get('memberId','')).strip(); phone=str(b.get('phone','')).strip(); plan_id=str(b.get('planId','')).strip(); amount=float(b.get('amount',0) or 0)
+        b=request.get_json(silent=True) or {}
+        member_id=str(b.get('memberId','')).strip() or None
         m=db.members.find_one({'id':member_id}) if member_id else None
-        if not m: return json_error('Select a valid member.',404,'MEMBER_NOT_FOUND')
+        if member_id and not m: return json_error('Member not found.',404,'MEMBER_NOT_FOUND')
+        phone=normalize_mpesa_phone(str(b.get('phone','')).strip() or ((m or {}).get('phone','')))
+        amount=float(b.get('amount',0) or 0)
+        if amount<=0 or amount>100000000: return json_error('Enter a positive payment amount.',422,'VALIDATION_ERROR')
+        name=str(b.get('name','')).strip() or (m or {}).get('name','') or 'Customer'
+        email=str(b.get('email','')).strip().lower() or (m or {}).get('email','') or ''
+        reference=str(b.get('reference','')).strip() or ('GLDC-'+secrets.token_hex(5).upper())
+        description=str(b.get('description','')).strip() or 'GLDC payment'
+        plan_id=str(b.get('planId','')).strip() or ((m or {}).get('membershipPlanId') or None)
         plan=_membership_plan(plan_id) if plan_id else None
-        if plan: amount=float(plan.get('price',0) or 0)
-        if amount<=0: return json_error('Select a paid tier or enter a positive amount.',422,'VALIDATION_ERROR')
-        phone=normalize_mpesa_phone(phone or m.get('phone'))
-        pid=make_id('PAY'); code='GLDC-RCP-'+secrets.token_hex(5).upper(); name=(plan or {}).get('name') or m.get('membershipPlan','Membership Payment')
-        p={'id':pid,'memberId':m['id'],'email':m.get('email',''),'phone':phone,'amount':amount,'currency':CURRENCY,'planId':(plan or {}).get('id') or m.get('membershipPlanId'),'planName':name,'method':'M-PESA','status':'PENDING','purpose':'MEMBERSHIP_ADMIN_PROMPT','receiptCode':code,'createdAt':now(),'updatedAt':now(),'source':'ADMIN_PROMPT','promptedBy':current_user().get('email')}
-        db.payments.insert_one(p); r=daraja_stk(phone,int(round(amount)),f'GLDC-{code}',f'{name} payment'); db.payments.update_one({'id':pid},{'$set':{'merchantRequestId':r.get('MerchantRequestID'),'checkoutRequestId':r.get('CheckoutRequestID'),'responseDescription':r.get('ResponseDescription'),'updatedAt':now()}})
-        audit('MEMBERSHIP_PAYMENT_PROMPTED','payment',pid,{'memberId':m['id'],'amount':amount,'phone':phone,'planId':p.get('planId')})
-        return jsonify(ok=True,paymentId=pid,receiptCode=code,status='PENDING',message=r.get('CustomerMessage','Payment prompt sent to the member.'),member=m.get('name'),phone=phone)
+        plan_name=(plan or {}).get('name','')
+        pid=make_id('PAY'); code='GLDC-RCP-'+secrets.token_hex(5).upper()
+        p={'id':pid,'memberId':member_id,'memberName':name,'email':email,'phone':phone,'amount':round(amount,2),'currency':CURRENCY,'planId':(plan or {}).get('id') or plan_id,'planName':plan_name,'method':'M-PESA','status':'PENDING','purpose':'GENERAL_PAYMENT_PROMPT','receiptCode':code,'reference':reference,'description':description,'createdAt':now(),'updatedAt':now(),'source':'ADMIN_PROMPT','promptedBy':current_user().get('email'),'verificationUrl':f'{APP_URL}/receipt/{code}'}
+        db.payments.insert_one(p)
+        try:
+            r=daraja_stk(phone,int(round(amount)),reference,description)
+        except Exception as e:
+            db.payments.update_one({'id':pid},{'$set':{'status':'FAILED','error':str(e),'userMessage':'We could not send the M-Pesa prompt. Please recheck the phone number and Daraja settings.','updatedAt':now()}})
+            raise
+        db.payments.update_one({'id':pid},{'$set':{'merchantRequestId':r.get('MerchantRequestID'),'checkoutRequestId':r.get('CheckoutRequestID'),'responseDescription':r.get('ResponseDescription'),'updatedAt':now()}})
+        audit('PAYMENT_PROMPTED','payment',pid,{'memberId':member_id,'amount':amount,'phone':phone,'reference':reference,'description':description})
+        return jsonify(ok=True,paymentId=pid,receiptCode=code,status='PENDING',message=r.get('CustomerMessage','M-Pesa prompt sent. Approve it on the phone.'),name=name,phone=phone,amount=amount,reference=reference)
     except Exception as e:
-        app.logger.exception('Admin membership prompt failed request=%s',request.request_id)
-        return json_error(str(e),500,'MEMBERSHIP_PROMPT_FAILED')
+        app.logger.exception('Admin generic payment prompt failed request=%s',request.request_id)
+        return json_error(str(e),500,'PAYMENT_PROMPT_FAILED')
 
 @app.get('/invoice/<invoice_number>')
 def invoice_verify_page(invoice_number):
@@ -2585,6 +2908,7 @@ def init_database():
     db.posts.create_index([('status',ASCENDING),('publishedAt',DESCENDING)])
     db.consultations.create_index([('scheduledAt',ASCENDING),('status',ASCENDING)])
     db.membership_plans.create_index([('status',ASCENDING),('sortOrder',ASCENDING)])
+    db.email_deliveries.create_index([('sentAt',DESCENDING)])
     db.membership_certificates.create_index([('certificateNumber',ASCENDING)], unique=True)
     db.membership_certificates.create_index([('memberId',ASCENDING),('issuedAt',DESCENDING)])
     db.membership_renewals.create_index([('memberId',ASCENDING),('createdAt',DESCENDING)])
