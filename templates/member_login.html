@@ -1,0 +1,18 @@
+{% extends 'base.html' %}
+{% block content %}
+<section class="section"><div class="container" style="max-width:560px">
+  <div class="form-card">
+    <span class="eyebrow">GLDC MEMBER PORTAL</span><h1>Member Login</h1>
+    <p>Sign in securely with the email verification code sent to your registered member email.</p>
+    <form id="loginForm"><div class="field"><label>Email address *</label><input id="email" type="email" required autocomplete="email"></div>
+    <button class="btn primary" id="sendBtn">SEND LOGIN CODE</button></form>
+    <div id="codeArea" style="display:none;margin-top:18px"><div class="field"><label>6-digit verification code *</label><input id="code" inputmode="numeric" maxlength="6" required autocomplete="one-time-code"></div><button class="btn primary" id="verifyBtn">SIGN IN</button></div>
+    <div id="msg"></div><hr><p>Not a member yet? <a href="/membership">View membership plans</a> or <a href="/member">register</a>.</p>
+  </div>
+</div></section>
+{% endblock %}
+{% block scripts %}<script>
+const csrf=document.querySelector('meta[name=csrf-token]').content; const msg=document.getElementById('msg');
+loginForm.addEventListener('submit',async e=>{e.preventDefault();const email=document.getElementById('email').value.trim().toLowerCase();const r=await fetch('/api/member/login/request',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({email})});const j=await r.json();if(!r.ok){msg.innerHTML='<div class="notice">'+(j.error?.message||'Unable to send login code.')+'</div>';return}document.getElementById('codeArea').style.display='block';document.getElementById('code').focus();msg.innerHTML='<div class="notice">Login code sent. Check your email.</div>';});
+verifyBtn.addEventListener('click',async()=>{const email=document.getElementById('email').value.trim().toLowerCase(),code=document.getElementById('code').value.trim();const r=await fetch('/api/member/login/verify',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({email,code})});const j=await r.json();if(!r.ok){msg.innerHTML='<div class="notice">'+(j.error?.message||'Verification failed.')+'</div>';return}location.href='/member/dashboard';});
+</script>{% endblock %}

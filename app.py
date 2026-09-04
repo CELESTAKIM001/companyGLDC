@@ -636,7 +636,7 @@ def security_headers(response):
     response.headers.setdefault('Referrer-Policy','strict-origin-when-cross-origin')
     response.headers.setdefault('Permissions-Policy','camera=(), microphone=(), geolocation=()')
     response.headers.setdefault('Cross-Origin-Opener-Policy','same-origin')
-    response.headers.setdefault('Content-Security-Policy', "default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
+    response.headers.setdefault('Content-Security-Policy', "default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self' 'unsafe-inline' https://unpkg.com; connect-src 'self' https://nominatim.openstreetmap.org; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
     if request.is_secure or app.config['SESSION_COOKIE_SECURE']:
         response.headers.setdefault('Strict-Transport-Security','max-age=31536000; includeSubDomains')
     return response
@@ -817,16 +817,32 @@ def api_verify_otp():
 
 @app.post('/api/leads')
 def api_leads():
-    try:
-        rate_limit('lead:'+client_ip(), maximum=int(os.getenv('LEAD_RATE_LIMIT_MAX','10'))); b=request.get_json(force=True) or {}
-        required=['name','phone','email','service','county','town','description','consent']
-        if any(not str(b.get(k,'')).strip() for k in required) or b.get('consent')!='yes' or '@' not in str(b.get('email','')): return json_error('Please check the enquiry form and correct the highlighted information.',422,'VALIDATION_ERROR')
-        if len(str(b['description']).strip())<10: return json_error('Please check the enquiry form and correct the highlighted information.',422,'VALIDATION_ERROR')
-        id='GLDC-LEAD-'+secrets.token_hex(5).upper(); t=now(); doc={**b,'id':id,'status':'NEW','emailVerified':False,'createdAt':t,'updatedAt':t}
-        db.leads.insert_one(doc); db.notifications.insert_one({'type':'NEW ENQUIRY','message':f'New enquiry {id}','createdAt':t,'read':False}); db.audit.insert_one({'action':'LEAD_CREATED','entity':id,'createdAt':t}); request_otp(str(b['email']).lower())
-        return jsonify(ok=True,id=id,verificationRequired=True),201
-    except RuntimeError as e: return json_error(str(e),500)
-    except Exception: return json_error('Please check the enquiry form and correct the highlighted information.',422,'VALIDATION_ERROR')
+    # CRM lead creation is deliberately restricted to authenticated members.
+    if not _member_session():
+        return json_error('Only authenticated GLDC members can create CRM leads. Please use phone, email or WhatsApp to contact GLDC.',403,'MEMBER_ONLY')
+    return _create_member_lead(request.get_json(force=True) or {})
+
+def _create_member_lead(b):
+    m=_member_doc()
+    if not m: return json_error('Member account not found.',404,'MEMBER_NOT_FOUND')
+    required=['name','phone','email','service','county','town','description']
+    if any(not str(b.get(k,'')).strip() for k in required) or '@' not in str(b.get('email','')): return json_error('Please complete all required lead fields.',422,'VALIDATION_ERROR')
+    if len(str(b['description']).strip())<10: return json_error('Lead description must be at least 10 characters.',422,'VALIDATION_ERROR')
+    rate_limit('member-lead:'+str(m.get('id')), maximum=int(os.getenv('LEAD_RATE_LIMIT_MAX','10')))
+    lead_id='GLDC-LEAD-'+secrets.token_hex(5).upper(); t=now()
+    doc={**b,'id':lead_id,'status':'NEW','source':'MEMBER PORTAL','memberId':m['id'],'memberEmail':m['email'],'createdAt':t,'updatedAt':t}
+    db.leads.insert_one(doc)
+    db.notifications.insert_one({'type':'NEW MEMBER LEAD','message':f'Member {m.get("name","")} created lead {lead_id}.','memberId':m['id'],'createdAt':t,'read':False})
+    db.notifications.insert_one({'type':'LEAD CREATED','message':f'Lead {lead_id} was submitted successfully.','memberId':m['id'],'createdAt':t,'read':False})
+    audit('MEMBER_LEAD_CREATED','lead',lead_id,{'memberId':m['id']})
+    return jsonify(ok=True,id=lead_id,memberId=m['id']),201
+
+@app.post('/api/member/leads')
+def api_member_lead_create():
+    if not _member_session(): return json_error('Member authentication required.',401,'UNAUTHORIZED')
+    try: return _create_member_lead(request.get_json(force=True) or {})
+    except RuntimeError as e: return json_error('Too many lead submissions. Please try again later.',429,'RATE_LIMITED') if str(e)=='RATE_LIMITED' else json_error('Unable to create lead.',500)
+    except Exception: return json_error('Unable to create lead.',500,'LEAD_CREATE_FAILED')
 
 @app.post('/api/members/register')
 def api_member_register():
@@ -1121,13 +1137,74 @@ def _send_member_email(kind, member, variables, attachments=None):
         subject=variables.get('subject','GLDC Membership Update'); text=variables.get('text',''); html=variables.get('html','<p>'+text+'</p>')
     send_email(member['email'],subject,text,html,attachments)
 
+@app.route('/member/login')
+def member_login_page():
+    if _member_session(): return redirect('/member/dashboard')
+    return render_template('member_login.html',title='Member Portal Login')
+
+@app.route('/member/register')
+def member_register_page(): return redirect('/member')
+
+@app.post('/api/member/login/request')
+def member_login_request():
+    try:
+        rate_limit('member-login:'+client_ip(), maximum=int(os.getenv('LOGIN_RATE_LIMIT_MAX','10')))
+        b=request.get_json(silent=True) or {}; email=str(b.get('email','')).strip().lower()
+        if '@' not in email: return json_error('Enter a valid member email address.',422,'VALIDATION_ERROR')
+        m=db.members.find_one({'email':email}) if db is not None else None
+        if not m or not m.get('emailVerified'):
+            return json_error('No verified membership account was found for this email. Please register for membership first.',404,'MEMBER_NOT_FOUND')
+        if m.get('status') in {'REJECTED','SUSPENDED'}:
+            return json_error('This membership account is not eligible for portal access. Please contact GLDC.',403,'MEMBER_ACCESS_BLOCKED')
+        request_otp(email)
+        return jsonify(ok=True,message='Member login code sent to your email.')
+    except RuntimeError as e:
+        if str(e)=='RATE_LIMITED': return json_error('Too many login attempts. Please try again later.',429,'RATE_LIMITED')
+        if str(e)=='OTP_COOLDOWN': return json_error('Please wait before requesting another code.',429,'OTP_COOLDOWN')
+        return json_error('Unable to send the login code.',503,'OTP_SEND_FAILED')
+    except Exception:
+        return json_error('Unable to send the login code.',503,'OTP_SEND_FAILED')
+
+@app.post('/api/member/login/verify')
+def member_login_verify():
+    b=request.get_json(silent=True) or {}; email=str(b.get('email','')).strip().lower(); code=str(b.get('code','')).strip()
+    try: verify_otp(email,code)
+    except RuntimeError as e: return json_error('The verification code is invalid or expired.',400,str(e))
+    m=db.members.find_one({'email':email}) if db is not None else None
+    if not m or not m.get('emailVerified'): return json_error('Member account not found or email is not verified.',403,'MEMBER_NOT_FOUND')
+    if m.get('status') in {'REJECTED','SUSPENDED'}: return json_error('This membership account is not eligible for portal access.',403,'MEMBER_ACCESS_BLOCKED')
+    session.clear(); session.permanent=True; csrf_token(); session['user']={'id':str(m['_id']),'memberId':m['id'],'email':m['email'],'name':m.get('name',''),'role':'MEMBER'}
+    audit('MEMBER_LOGIN','member',m['id']); return jsonify(ok=True,user=session['user'])
+
 @app.route('/membership')
 def membership_page(): return render_template('membership.html',title='GLDC Membership')
 
 @app.route('/member/dashboard')
 def member_dashboard():
-    if not _member_session(): return redirect('/membership')
-    return render_template('member_dashboard.html',title='Member Dashboard')
+    if not _member_session(): return redirect('/member/login')
+    return render_template('member_dashboard.html',title='Member Portal')
+
+@app.get('/api/member/portal')
+def member_portal_api():
+    m=_member_doc()
+    if not m: return json_error('Member authentication required.',401,'UNAUTHORIZED')
+    member_id=m.get('id')
+    docs=[clean_doc(x) for x in db.member_documents.find({'memberId':member_id}).sort('createdAt',DESCENDING).limit(100)]
+    payments=[clean_doc(x) for x in db.payments.find({'memberId':member_id}).sort('createdAt',DESCENDING).limit(100)]
+    leads=[clean_doc(x) for x in db.leads.find({'memberId':member_id}).sort('createdAt',DESCENDING).limit(100)]
+    notifications=[clean_doc(x) for x in db.notifications.find({'memberId':member_id}).sort('createdAt',DESCENDING).limit(100)]
+    plans=[clean_doc(x) for x in db.membership_plans.find({'status':'ACTIVE'}).sort('sortOrder',ASCENDING)]
+    return jsonify(ok=True,member=_member_public(m)|{'bio':m.get('bio',''),'profession':m.get('profession',''),'company':m.get('company',''),'location':m.get('location',''),'portfolioUrl':m.get('portfolioUrl',''),'certificateNumber':m.get('certificateNumber'),'certificateDriveId':m.get('certificateDriveId')},documents=docs,payments=payments,leads=leads,notifications=notifications,plans=plans)
+
+@app.get('/api/member/certificate')
+def member_certificate_download():
+    m=_member_doc()
+    if not m or not m.get('certificateDriveId'): return json_error('Membership certificate is not available yet.',404,'CERTIFICATE_NOT_AVAILABLE')
+    try:
+        data=drive_download_bytes_by_id(m['certificateDriveId'])
+        return Response(data,mimetype='application/pdf',headers={'Content-Disposition':f'inline; filename="GLDC-{m.get("certificateNumber","membership-certificate")}.pdf"'})
+    except Exception: return json_error('Unable to retrieve your membership certificate.',503,'CERTIFICATE_DOWNLOAD_FAILED')
+
 
 @app.route('/members/<slug>')
 def member_profile(slug):
@@ -1335,9 +1412,14 @@ def admin_locations(): return jsonify(ok=True,locations=list_collection('office_
 @app.post('/api/admin/locations')
 @admin_required
 def admin_location_create():
-    b=request.get_json(silent=True) or {}; name=str(b.get('name','')).strip(); lat=float(b.get('lat',0) or 0); lng=float(b.get('lng',0) or 0)
-    if not name or not (-90<=lat<=90 and -180<=lng<=180): return json_error('Office name and valid map coordinates are required.',422,'VALIDATION_ERROR')
-    doc={'id':make_id('OFF'),'name':name,'address':str(b.get('address','')).strip(),'description':str(b.get('description','')).strip(),'phone':str(b.get('phone','')).strip(),'email':str(b.get('email','')).strip(),'hours':str(b.get('hours','')).strip(),'lat':lat,'lng':lng,'zoom':int(b.get('zoom',15) or 15),'primary':bool(b.get('primary',False)),'status':'PUBLISHED','createdAt':now(),'updatedAt':now()}; db.office_locations.insert_one(doc); audit('OFFICE_LOCATION_CREATED','office',doc['id']); return jsonify(ok=True,location=clean_doc(doc)),201
+    b=request.get_json(silent=True) or {}; name=str(b.get('name','')).strip(); address=str(b.get('address','')).strip()
+    try: lat=float(b.get('lat')) ; lng=float(b.get('lng'))
+    except (TypeError,ValueError): return json_error('Select the office position on the basemap before saving.',422,'MAP_LOCATION_REQUIRED')
+    if not name or not address or not (-90<=lat<=90 and -180<=lng<=180): return json_error('Office name, address and a valid basemap position are required.',422,'VALIDATION_ERROR')
+    primary=str(b.get('primary','NO')).upper() in ('YES','TRUE','1')
+    zoom=int(b.get('zoom',15) or 15); zoom=max(10,min(19,zoom))
+    status=str(b.get('status','PUBLISHED')).upper(); status=status if status in ('PUBLISHED','DRAFT','ARCHIVED') else 'DRAFT'
+    doc={'id':make_id('OFF'),'name':name,'address':address,'description':str(b.get('description','')).strip(),'phone':str(b.get('phone','')).strip(),'email':str(b.get('email','')).strip(),'hours':str(b.get('hours','')).strip(),'lat':lat,'lng':lng,'zoom':zoom,'primary':primary,'status':status,'createdAt':now(),'updatedAt':now()}; db.office_locations.insert_one(doc); audit('OFFICE_LOCATION_CREATED','office',doc['id']); return jsonify(ok=True,location=clean_doc(doc)),201
 
 @app.patch('/api/admin/locations/<location_id>')
 @admin_required
