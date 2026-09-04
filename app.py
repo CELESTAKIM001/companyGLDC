@@ -17,6 +17,7 @@ import jwt
 from dotenv import load_dotenv
 from flask import Flask, render_template, request, jsonify, redirect, url_for, session, flash, send_file, abort, Response
 from pymongo import MongoClient, ASCENDING, DESCENDING, ReturnDocument
+from pymongo.errors import DuplicateKeyError
 
 load_dotenv()
 
@@ -582,21 +583,57 @@ def drive_download(file_id):
     data=_drive_download_direct(file_id, meta, 'Drive file download')
     return meta,name,mt or 'application/octet-stream',data
 
+def normalize_mpesa_phone(phone):
+    # Daraja expects PartyA/PhoneNumber in international MSISDN format (2547XXXXXXXX / 2541XXXXXXXX).
+    raw=re.sub(r'[^0-9+]', '', str(phone or '').strip())
+    if raw.startswith('+'): raw=raw[1:]
+    if raw.startswith('0') and len(raw)==10:
+        raw='254'+raw[1:]
+    elif raw.startswith('7') or raw.startswith('1'):
+        if len(raw)==9: raw='254'+raw
+    if not re.fullmatch(r'254[17]\d{8}', raw):
+        raise RuntimeError('INVALID_MPESA_PHONE:Use a Kenyan mobile number such as 0712345678 or +254712345678.')
+    return raw
+
 def daraja_token():
-    base='https://api.safaricom.co.ke' if os.getenv('DARAJA_ENV','production')=='production' else 'https://sandbox.safaricom.co.ke'
-    raw=f"{os.getenv('DARAJA_CONSUMER_KEY','')}:{os.getenv('DARAJA_CONSUMER_SECRET','')}".encode()
+    base='https://api.safaricom.co.ke' if str(env('DARAJA_ENV','DARAJA_ENVIRONMENT', default='production')).lower()=='production' else 'https://sandbox.safaricom.co.ke'
+    key=str(env('DARAJA_CONSUMER_KEY', default=''))
+    secret=str(env('DARAJA_CONSUMER_SECRET', default=''))
+    if not key or not secret:
+        raise RuntimeError('DARAJA_CONFIG_MISSING:Configure DARAJA_CONSUMER_KEY and DARAJA_CONSUMER_SECRET.')
+    raw=f'{key}:{secret}'.encode()
     auth=base64.b64encode(raw).decode()
-    r=requests.get(base+'/oauth/v1/generate?grant_type=client_credentials',headers={'Authorization':'Basic '+auth},timeout=20); r.raise_for_status(); return base,r.json()['access_token']
+    r=requests.get(base+'/oauth/v1/generate?grant_type=client_credentials',headers={'Authorization':'Basic '+auth},timeout=20)
+    try: data=r.json()
+    except Exception: data={}
+    if not r.ok or not data.get('access_token'):
+        msg=data.get('errorMessage') or data.get('error_description') or data.get('errorCode') or f'HTTP {r.status_code}'
+        raise RuntimeError('DARAJA_TOKEN_FAILED:'+str(msg))
+    return base,data['access_token']
 
 def daraja_stk(phone,amount,reference,description):
-    base,access=daraja_token(); ts=datetime.now().strftime('%Y%m%d%H%M%S'); short=str(env('DARAJA_SHORTCODE','DARAJA_PARTY_A_SHORTCODE', default='')); passkey=str(env('DARAJA_PASSKEY', default=''))
+    customer=normalize_mpesa_phone(phone)
+    amount=int(round(float(amount)))
+    if amount < 1: raise RuntimeError('INVALID_PAYMENT_AMOUNT:Payment amount must be at least KES 1.')
+    transaction_type=str(env('DARAJA_TRANSACTION_TYPE','MPESA_TRANSACTION_TYPE', default='CustomerBuyGoodsOnline'))
+    short=str(env('DARAJA_SHORTCODE','DARAJA_PARTY_A_SHORTCODE', default='')).strip()
+    till=str(env('DARAJA_TILL_NUMBER','DARAJA_PARTY_B_BUYGOODS_TILL','DARAJA_BUYGOODS_TILL', default='')).strip()
+    passkey=str(env('DARAJA_PASSKEY', default='')).strip()
+    if not short or not passkey: raise RuntimeError('DARAJA_CONFIG_MISSING:Configure DARAJA_SHORTCODE and DARAJA_PASSKEY.')
+    if transaction_type=='CustomerBuyGoodsOnline' and not till:
+        raise RuntimeError('DARAJA_CONFIG_MISSING:Configure DARAJA_TILL_NUMBER for CustomerBuyGoodsOnline.')
+    base,access=daraja_token(); ts=datetime.now().strftime('%Y%m%d%H%M%S')
     password=base64.b64encode(f'{short}{passkey}{ts}'.encode()).decode()
-    callback = str(env('DARAJA_CALLBACK_URL', default=APP_URL + '/api/payments/callback')).rstrip('/')
-    if not callback.endswith('/api/payments/callback'):
-        callback += '/api/payments/callback'
-    body={'BusinessShortCode':str(env('DARAJA_SHORTCODE','DARAJA_PARTY_A_SHORTCODE', default='')),'Password':password,'Timestamp':ts,'TransactionType':str(env('DARAJA_TRANSACTION_TYPE','MPESA_TRANSACTION_TYPE', default='CustomerBuyGoodsOnline')),'Amount':round(amount),'PartyA':str(env('DARAJA_PARTY_A_SHORTCODE','DARAJA_SHORTCODE', default='')),'PartyB':str(env('DARAJA_TILL_NUMBER','DARAJA_PARTY_B_BUYGOODS_TILL', default='')),'PhoneNumber':phone,'CallBackURL':callback,'AccountReference':reference,'TransactionDesc':description}
-    r=requests.post(base+'/mpesa/stkpush/v1/processrequest',headers={'Authorization':'Bearer '+access,'Content-Type':'application/json'},json=body,timeout=30); data=r.json()
-    if not r.ok or data.get('ResponseCode')!='0': raise RuntimeError('DARAJA_STK_FAILED:'+str(data.get('ResponseDescription') or data.get('errorMessage') or 'Unknown error'))
+    callback=str(env('DARAJA_CALLBACK_URL', default=APP_URL + '/api/payments/callback')).strip().rstrip('/')
+    if not callback.endswith('/api/payments/callback'): callback += '/api/payments/callback'
+    # IMPORTANT: PartyA is the customer's phone, not the business shortcode.
+    body={'BusinessShortCode':short,'Password':password,'Timestamp':ts,'TransactionType':transaction_type,'Amount':amount,'PartyA':customer,'PartyB':till or short,'PhoneNumber':customer,'CallBackURL':callback,'AccountReference':str(reference)[:12],'TransactionDesc':str(description)[:13]}
+    r=requests.post(base+'/mpesa/stkpush/v1/processrequest',headers={'Authorization':'Bearer '+access,'Content-Type':'application/json'},json=body,timeout=30)
+    try: data=r.json()
+    except Exception: data={}
+    if not r.ok or data.get('ResponseCode')!='0':
+        msg=data.get('ResponseDescription') or data.get('errorMessage') or data.get('error_description') or data.get('errorCode') or f'HTTP {r.status_code}'
+        raise RuntimeError('DARAJA_STK_FAILED:'+str(msg))
     return data
 
 def client_ip():
@@ -1290,11 +1327,68 @@ def membership_plans(): return jsonify(ok=True,plans=[clean_doc(x) for x in db.m
 
 @app.post('/api/membership/register')
 def membership_register_v14():
-    b=request.get_json(silent=True) or {}; name=str(b.get('name','')).strip(); email=str(b.get('email','')).strip().lower(); phone=str(b.get('phone','')).strip()
-    if len(name)<2 or '@' not in email or len(phone)<7: return json_error('Name, valid email and phone are required.',422,'VALIDATION_ERROR')
-    if db.members.find_one({'email':email,'status':{'$in':['ACTIVE','PENDING_PAYMENT','PENDING_REVIEW','APPROVED']}}): return json_error('A membership account already exists for this email.',409,'MEMBER_EXISTS')
-    member={'id':make_id('MEM'),'membershipNumber':'PENDING-'+secrets.token_hex(4).upper(),'name':name,'email':email,'phone':phone,'profileSlug':_slugify(name)+'-'+secrets.token_hex(3),'status':'EMAIL_PENDING','emailVerified':False,'createdAt':now(),'updatedAt':now(),'bio':str(b.get('bio','')).strip(),'profession':str(b.get('profession','')).strip(),'company':str(b.get('company','')).strip(),'location':str(b.get('location','')).strip(),'locationLat':float(b['locationLat']) if str(b.get('locationLat','')).strip() else None,'locationLng':float(b['locationLng']) if str(b.get('locationLng','')).strip() else None,'portfolioUrl':str(b.get('portfolioUrl','')).strip()}
-    db.members.insert_one(member); request_otp(email); audit('MEMBERSHIP_REGISTERED','member',member['id']); return jsonify(ok=True,memberId=member['id'],message='Verification code sent to your email.')
+    # Never allow a malformed registration to reach MongoDB/SMTP and never expose a raw
+    # exception to the member. Existing EMAIL_PENDING records are resumable instead of
+    # causing a duplicate-key 500 when the user submits the form again.
+    try:
+        b=request.get_json(silent=True) or {}
+        name=str(b.get('name','')).strip()
+        email=str(b.get('email','')).strip().lower()
+        phone_input=str(b.get('phone','')).strip()
+        email_ok=bool(re.fullmatch(r'[A-Za-z0-9.!#$%&\'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+',email))
+        if len(name)<2: return json_error('Please enter your full name.',422,'NAME_INVALID')
+        if not email_ok: return json_error('Please enter a valid email address, for example name@example.com.',422,'EMAIL_INVALID')
+        try: phone=normalize_mpesa_phone(phone_input)
+        except RuntimeError: return json_error('Please use a valid Kenyan M-Pesa number, for example 0712345678 or +254712345678.',422,'PHONE_INVALID')
+        existing=db.members.find_one({'email':email})
+        if existing:
+            status=str(existing.get('status','')).upper()
+            if status=='EMAIL_PENDING':
+                resume_token=existing.get('resumeToken')
+                if not resume_token:
+                    resume_token=secrets.token_urlsafe(32)
+                    db.members.update_one({'_id':existing['_id']},{'$set':{'resumeToken':resume_token,'updatedAt':now()}})
+                return jsonify(ok=False,resume=True,memberId=existing.get('id'),resumeToken=resume_token,status=status,error={'code':'REGISTRATION_IN_PROGRESS','message':'A registration for this email has already started. Use Continue where you left off.'}),409
+            return json_error('A membership account already exists for this email. Please use Member Login.',409,'MEMBER_EXISTS')
+        member={'id':make_id('MEM'),'resumeToken':secrets.token_urlsafe(32),'membershipNumber':'PENDING-'+secrets.token_hex(4).upper(),'name':name,'email':email,'phone':phone,'profileSlug':_slugify(name)+'-'+secrets.token_hex(3),'status':'EMAIL_PENDING','emailVerified':False,'createdAt':now(),'updatedAt':now(),'bio':str(b.get('bio','')).strip(),'profession':str(b.get('profession','')).strip(),'company':str(b.get('company','')).strip(),'location':str(b.get('location','')).strip(),'locationLat':float(b['locationLat']) if str(b.get('locationLat','')).strip() else None,'locationLng':float(b['locationLng']) if str(b.get('locationLng','')).strip() else None,'portfolioUrl':str(b.get('portfolioUrl','')).strip()}
+        try:
+            db.members.insert_one(member)
+        except DuplicateKeyError:
+            existing=db.members.find_one({'email':email})
+            if existing and not existing.get('resumeToken'):
+                existing['resumeToken']=secrets.token_urlsafe(32)
+                db.members.update_one({'_id':existing['_id']},{'$set':{'resumeToken':existing['resumeToken'],'updatedAt':now()}})
+            return jsonify(ok=False,resume=True,memberId=existing.get('id') if existing else None,resumeToken=existing.get('resumeToken') if existing else None,error={'code':'REGISTRATION_IN_PROGRESS','message':'A registration for this email already exists. Use Continue where you left off.'}),409
+        try:
+            request_otp(email)
+        except RuntimeError as e:
+            app.logger.warning('Membership OTP send failed request=%s code=%s',getattr(request,'request_id','unknown'),str(e))
+            return jsonify(ok=False,resume=True,memberId=member['id'],resumeToken=member['resumeToken'],status='EMAIL_PENDING',error={'code':'OTP_SEND_FAILED','message':'Your registration was saved, but we could not send the verification code right now. Use Continue where you left off and try again.'}),503
+        except Exception:
+            app.logger.exception('Membership OTP send failed request=%s',getattr(request,'request_id','unknown'))
+            return jsonify(ok=False,resume=True,memberId=member['id'],resumeToken=member['resumeToken'],status='EMAIL_PENDING',error={'code':'OTP_SEND_FAILED','message':'Your registration was saved, but the verification email could not be sent. Please try Continue where you left off again.'}),503
+        audit('MEMBERSHIP_REGISTERED','member',member['id'])
+        return jsonify(ok=True,memberId=member['id'],resumeToken=member['resumeToken'],message='Verification code sent to your email.')
+    except Exception:
+        app.logger.exception('Membership registration failed request=%s',getattr(request,'request_id','unknown'))
+        return json_error('We could not complete registration right now. Please check your details and try again.',503,'REGISTRATION_UNAVAILABLE')
+
+@app.post('/api/membership/resume')
+def membership_resume():
+    try:
+        b=request.get_json(silent=True) or {}; email=str(b.get('email','')).strip().lower(); member_id=str(b.get('memberId','')).strip(); token=str(b.get('resumeToken','')).strip()
+        if not email or not member_id or not token: return json_error('Your saved registration session is incomplete. Please start again.',422,'RESUME_INVALID')
+        m=db.members.find_one({'email':email,'id':member_id,'resumeToken':token})
+        if not m: return json_error('This saved registration could not be found. Please start a new registration.',404,'RESUME_NOT_FOUND')
+        status=str(m.get('status','')).upper()
+        session['user']={'id':str(m.get('_id')),'memberId':m.get('id'),'email':m.get('email'),'name':m.get('name',''),'role':'MEMBER'}
+        if status=='EMAIL_PENDING': return jsonify(ok=True,status=status,memberId=m.get('id'),message='Your registration is ready to continue. Verify your email to proceed.')
+        if status in {'PENDING_PAYMENT','PAYMENT_FAILED','PAYMENT_PENDING','RENEWAL_PENDING'}: return jsonify(ok=True,status=status,memberId=m.get('id'),message='Welcome back. Continue to membership plan and payment.')
+        if status in {'PENDING_REVIEW','ACTIVE','EXPIRING_SOON','EXPIRED'}: return jsonify(ok=True,status=status,memberId=m.get('id'),message='Welcome back. Continue from your Member Portal.')
+        return jsonify(ok=True,status=status,memberId=m.get('id'))
+    except Exception:
+        app.logger.exception('Membership resume failed request=%s',getattr(request,'request_id','unknown'))
+        return json_error('We could not resume your registration right now. Please try again.',503,'RESUME_UNAVAILABLE')
 
 @app.post('/api/membership/resend-otp')
 def membership_resend_otp():
