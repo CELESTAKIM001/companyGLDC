@@ -1,4 +1,5 @@
 import os, re, json, base64, hashlib, secrets, smtplib, time, socket
+import hashlib
 from urllib.parse import urlsplit, urlunsplit
 from datetime import datetime, timedelta, timezone, date
 from zoneinfo import ZoneInfo
@@ -700,6 +701,50 @@ def drive_files(minimum=40, max_files=200):
     return files[:limit]
 
 
+def site_content_json(key, default):
+    """Read a JSON-encoded public content value safely."""
+    if db is None:
+        return default
+    try:
+        row=db.content.find_one({'key':key},{'_id':0,'value':1}) or {}
+        raw=row.get('value')
+        if not raw:
+            return default
+        value=json.loads(raw)
+        return value if isinstance(value, type(default)) else default
+    except Exception:
+        return default
+
+
+def drive_image_code(file_id):
+    """Return a stable human-friendly admin code for a Drive image."""
+    raw=str(file_id or '').strip()
+    if not raw:
+        return ''
+    return 'IMG-' + hashlib.sha1(raw.encode('utf-8')).hexdigest()[:10].upper()
+
+
+def drive_image_files(max_files=300):
+    """List only real PNG/JPEG/JPG files from the configured Drive folder."""
+    files=drive_files(minimum=1, max_files=max_files)
+    allowed={'image/png','image/jpeg','image/jpg'}
+    out=[]
+    for f in files:
+        mt=str(f.get('mimeType','')).lower()
+        name=str(f.get('name',''))
+        ext=Path(name).suffix.lower()
+        if mt in allowed or ext in {'.png','.jpg','.jpeg'}:
+            x=dict(f)
+            x['code']=drive_image_code(f.get('id'))
+            x['previewUrl']='/api/admin/drive/image/'+str(f.get('id'))
+            try:
+                db.site_media_codes.update_one({'code':x['code']},{'$set':{'code':x['code'],'driveFileId':str(f.get('id')),'name':x.get('name',''),'mimeType':x.get('mimeType',''),'updatedAt':now()}},upsert=True)
+            except Exception:
+                app.logger.exception('Could not cache Drive image code %s', x['code'])
+            out.append(x)
+    return out
+
+
 def drive_upload_bytes(filename, data, mimetype, folder=None):
     if not env_bool('GOOGLE_DRIVE_ENABLED', default=True):
         raise RuntimeError('GOOGLE_DRIVE_DISABLED')
@@ -1051,12 +1096,60 @@ def inject_security():
 @app.context_processor
 def globals_():
     whatsapp_url=''; hero_image_url=''
+    homepage={
+        'eyebrow':'GAVIN LAND & DESIGN CONSULTANTS',
+        'title':'Land. Design. Development. Done Right.',
+        'text':'Professional consultancy solutions for land development, planning and design — coordinated around practical project outcomes.',
+        'primaryCta':'REQUEST A QUOTE',
+        'secondaryCta':'VIEW PROJECTS',
+        'stats':[
+            {'value':'04','label':'Core consultancy disciplines'},
+            {'value':'360°','label':'Land-to-development workflow'},
+            {'value':'100%','label':'Secure server-side credentials'},
+            {'value':'KENYA','label':'Nairobi-led service delivery'},
+        ],
+        'services':[
+            {'icon':'','imageCode':'','title':'Land Development Consultancy','text':'Land-use planning, site analysis and development feasibility.','cta':'Start an enquiry →','href':'/quote'},
+            {'icon':'','imageCode':'','title':'Architectural Design','text':'Architectural concepts, plans, drawings and visualization.','cta':'Start an enquiry →','href':'/quote'},
+            {'icon':'','imageCode':'','title':'Planning & Approvals','text':'Planning applications, approvals and regulatory support.','cta':'Start an enquiry →','href':'/quote'},
+            {'icon':'','imageCode':'','title':'Project Consultancy','text':'Project planning, coordination and monitoring.','cta':'Start an enquiry →','href':'/quote'},
+        ],
+        'workflow':{
+            'eyebrow':'A CLEARER WORKFLOW','title':'From first question to project delivery.',
+            'text':'Get structured support for feasibility, planning, design, approvals and coordination without losing sight of the commercial objective.',
+            'features':['Defined scope and deliverables','Transparent communication','Secure enquiries and member workflows','Google Drive-backed document access'],
+            'imageCode':''
+        },
+        'approach':{
+            'eyebrow':'OUR APPROACH','title':'Clear, practical, accountable.',
+            'text':'We focus on responsible documentation, transparent communication, coordinated project delivery and advice that can be acted on.',
+            'imageCode':''
+        },
+        'mission':{
+            'eyebrow':'MISSION','title':'Move projects forward.',
+            'text':'Our consultancy workflow is designed to reduce uncertainty from early land and planning decisions through design and development.',
+            'imageCode':''
+        },
+        'startProject':{'eyebrow':'START A PROJECT','title':'Ready to move your project forward?','text':'Tell us what you are planning and the GLDC team can guide the next step.','cta':'GET A CONSULTATION','href':'/quote'}
+    }
     if db is not None:
         try:
             w=db.settings.find_one({'key':'whatsapp'}) or {}; whatsapp_url=w.get('url','') if w.get('enabled') else ''
             m=db.media.find_one({'slot':'home.hero','status':'PUBLISHED'}) or {}; hero_image_url=f'/api/public/media/{m.get("driveFileId")}' if m.get('driveFileId') else ''
+            cms={x.get('key'):x.get('value') for x in db.content.find({'key':{'$regex':r'^home\.'}})}
+            homepage['eyebrow']=cms.get('home.heroEyebrow') or homepage['eyebrow']
+            homepage['title']=cms.get('home.heroTitle') or homepage['title']
+            homepage['text']=cms.get('home.heroText') or homepage['text']
+            homepage['primaryCta']=cms.get('home.heroPrimaryCta') or homepage['primaryCta']
+            homepage['secondaryCta']=cms.get('home.heroSecondaryCta') or homepage['secondaryCta']
+            homepage['stats']=site_content_json('home.stats',homepage['stats'])
+            homepage['services']=site_content_json('home.services',homepage['services'])
+            homepage['workflow']=site_content_json('home.workflow',homepage['workflow'])
+            homepage['approach']=site_content_json('home.approach',homepage['approach'])
+            homepage['mission']=site_content_json('home.mission',homepage['mission'])
+            homepage['startProject']=site_content_json('home.startProject',homepage['startProject'])
         except Exception: pass
-    return {'current_user':current_user(),'currency':CURRENCY,'year':datetime.now().year,'admin_path':ADMIN_PATH,'app_url':APP_URL,'whatsapp_url':whatsapp_url,'hero_image_url':hero_image_url}
+    return {'current_user':current_user(),'currency':CURRENCY,'year':datetime.now().year,'admin_path':ADMIN_PATH,'app_url':APP_URL,'whatsapp_url':whatsapp_url,'hero_image_url':hero_image_url,'homepage':homepage}
 
 @app.get('/api/health')
 def api_health():
@@ -1124,7 +1217,11 @@ def faq(): return render_template('faq.html', title='Frequently Asked Questions'
 def insights():
     posts=[]
     if db is not None:
-        try: posts=[clean_doc(x) for x in db.posts.find({'status':'PUBLISHED'}).sort('publishedAt',DESCENDING).limit(50)]
+        try:
+            posts=[clean_doc(x) for x in db.posts.find({'status':'PUBLISHED'}).sort('publishedAt',DESCENDING).limit(50)]
+            for post in posts:
+                if post.get('imageCode'):
+                    post['imageUrl']=f"/api/public/site-image/{post.get('imageCode')}"
         except Exception: pass
     return render_template('insights.html', title='Insights & Resources', posts=posts)
 @app.route('/consultation')
@@ -1263,6 +1360,33 @@ def api_member_verify():
     except RuntimeError as e:
         if str(e) in ['OTP_EXPIRED','OTP_LOCKED','OTP_INVALID']: return json_error('The verification code is invalid or expired.',400,str(e))
         return json_error(str(e),500)
+
+@app.get('/api/admin/drive/images')
+@admin_required
+def api_admin_drive_images():
+    try:
+        return jsonify(ok=True,images=drive_image_files())
+    except Exception as e:
+        app.logger.exception('Google Drive image listing failed')
+        return json_error(str(e),500,'DRIVE_IMAGE_LIST_FAILED')
+
+@app.get('/api/admin/drive/image/<file_id>')
+@admin_required
+def api_admin_drive_image(file_id):
+    try:
+        meta=drive_metadata(file_id)[2]
+        mt=str(meta.get('mimeType','')).lower()
+        if mt not in {'image/png','image/jpeg','image/jpg'}:
+            return Response('Not an image',415)
+        data=drive_download_bytes_by_id(file_id)
+        response=Response(data,status=200,mimetype=mt)
+        response.headers['Cache-Control']='private, max-age=300'
+        response.headers['X-Drive-File-Id']=str(meta.get('id',''))
+        response.headers['X-Drive-Image-Code']=drive_image_code(meta.get('id'))
+        return response
+    except Exception as e:
+        app.logger.exception('Google Drive admin image preview failed for %s',file_id)
+        return Response('Image unavailable',404)
 
 @app.get('/api/drive/files')
 @admin_required
@@ -1422,7 +1546,8 @@ def api_content(): return jsonify(ok=True,content=list(db.content.find({}, {'_id
 def api_content_save():
     b=request.get_json(force=True) or {}; key=str(b.get('key','')).strip(); value=str(b.get('value','')); 
     if not key or len(key)>160: return json_error('Invalid key',422,'VALIDATION_ERROR')
-    db.content.update_one({'key':key},{'$set':{'key':key,'value':value,'updatedAt':now()}},upsert=True); return jsonify(ok=True)
+    is_public=bool(b.get('public',True))
+    db.content.update_one({'key':key},{'$set':{'key':key,'value':value,'public':is_public,'updatedAt':now()}},upsert=True); return jsonify(ok=True)
 
 @app.get('/api/admin/invoices')
 @admin_required
@@ -2873,6 +2998,72 @@ def admin_email_template_test():
     if '@' not in to: return json_error('Valid recipient email required.',422,'VALIDATION_ERROR')
     send_email(to,subject,text,html); audit('EMAIL_TEMPLATE_TEST_SENT','email_template',str(b.get('name',''))); return jsonify(ok=True)
 
+@app.get('/api/admin/insights')
+@admin_required
+def api_admin_insights():
+    try:
+        rows=[clean_doc(x) for x in db.posts.find({}).sort('publishedAt',DESCENDING).limit(200)]
+        return jsonify(ok=True,posts=rows)
+    except Exception as e:
+        return json_error(str(e),500,'INSIGHTS_LIST_FAILED')
+
+@app.post('/api/admin/insights')
+@admin_required
+def api_admin_insights_save():
+    b=request.get_json(silent=True) or {}
+    post_id=str(b.get('id','')).strip()
+    title=str(b.get('title','')).strip()
+    category=str(b.get('category','GLDC')).strip() or 'GLDC'
+    excerpt=str(b.get('excerpt','')).strip()
+    content=str(b.get('content','')).strip()
+    status=str(b.get('status','DRAFT')).strip().upper()
+    image_code=str(b.get('imageCode','')).strip().upper()
+    if not title or not content:
+        return json_error('Insight title and content are required.',422,'VALIDATION_ERROR')
+    if image_code and not image_code.startswith('IMG-'):
+        return json_error('Image code must be a GLDC Drive image code such as IMG-XXXXXXXXXX.',422,'VALIDATION_ERROR')
+    doc={'title':title,'category':category,'excerpt':excerpt,'content':content,'status':status,'imageCode':image_code,'updatedAt':now(),'updatedBy':current_user().get('email')}
+    if status=='PUBLISHED' and (not post_id or not db.posts.find_one({'id':post_id})):
+        doc['publishedAt']=now()
+    if post_id:
+        db.posts.update_one({'id':post_id},{'$set':doc})
+        audit('INSIGHT_UPDATED','post',post_id,{'title':title,'status':status,'imageCode':image_code})
+        return jsonify(ok=True,id=post_id)
+    new_id=make_id('POST')
+    doc.update({'id':new_id,'createdAt':now(),'publishedAt':now() if status=='PUBLISHED' else None})
+    db.posts.insert_one(doc)
+    audit('INSIGHT_CREATED','post',new_id,{'title':title,'status':status,'imageCode':image_code})
+    return jsonify(ok=True,id=new_id)
+
+@app.delete('/api/admin/insights/<post_id>')
+@admin_required
+def api_admin_insight_delete(post_id):
+    db.posts.delete_one({'id':post_id})
+    audit('INSIGHT_DELETED','post',post_id)
+    return jsonify(ok=True)
+
+
+@app.get('/api/public/site-image/<code>')
+def public_site_image(code):
+    """Serve a Drive image that an Admin has explicitly published by image code."""
+    code=str(code or '').strip().upper()
+    if not code.startswith('IMG-'):
+        return Response('Not found',404)
+    try:
+        rec=db.site_media_codes.find_one({'code':code},{'_id':0,'driveFileId':1,'mimeType':1}) if db is not None else None
+        if not rec or not rec.get('driveFileId'):
+            return Response('Not found',404)
+        fid=str(rec['driveFileId'])
+        data=drive_download_bytes_by_id(fid)
+        mt=str(rec.get('mimeType') or 'image/jpeg').lower()
+        if mt not in {'image/png','image/jpeg','image/jpg'}:
+            return Response('Not found',404)
+        return Response(data,mimetype=mt,headers={'Cache-Control':'public, max-age=3600'})
+    except Exception:
+        app.logger.exception('Public site image failed for code %s', code)
+        return Response('Not found',404)
+
+
 @app.get('/api/public/media/<file_id>')
 def public_media(file_id):
     if db is None: return Response('Not found',404)
@@ -3362,7 +3553,19 @@ def init_database():
     }
     for name,t in email_defaults.items(): db.email_templates.update_one({'name':name},{'$setOnInsert':{'name':name,'createdAt':now()},'$set':t},upsert=True)
     db.settings.update_one({'key':'membership_policy'},{'$setOnInsert':{'key':'membership_policy','renewalWindowDays':30,'abandonEmailHours':MEMBERSHIP_ABANDON_EMAIL_HOURS,'abandonPaymentHours':MEMBERSHIP_ABANDON_PAYMENT_HOURS,'abandonRenotifyHours':MEMBERSHIP_ABANDON_RENOTIFY_HOURS,'createdAt':now()}},upsert=True)
-    defaults={'home.heroTitle':'Land. Design. Development. Done Right.','home.heroText':'Professional land, planning, design and development consultancy for clients who need practical outcomes.','home.primaryCta':'REQUEST A QUOTE','home.secondaryCta':'VIEW PROJECTS','site.company':'Gavin Land & Design Consultants','site.tagline':'Land • Design • Development • Consultancy','site.phone':'+254','site.email':'info@yourdomain.co.ke','site.location':'Kenya'}
+    defaults={
+        'home.heroTitle':'Land. Design. Development. Done Right.',
+        'home.heroText':'Professional consultancy solutions for land development, planning and design — coordinated around practical project outcomes.',
+        'home.primaryCta':'REQUEST A QUOTE',
+        'home.secondaryCta':'VIEW PROJECTS',
+        'home.stats':json.dumps([{'value':'04','label':'Core consultancy disciplines'},{'value':'360°','label':'Land-to-development workflow'},{'value':'100%','label':'Secure server-side credentials'},{'value':'KENYA','label':'Nairobi-led service delivery'}]),
+        'home.services':json.dumps([{'icon':'','imageCode':'','title':'Land Development Consultancy','text':'Land-use planning, site analysis and development feasibility.','cta':'Start an enquiry →','href':'/quote'},{'icon':'','imageCode':'','title':'Architectural Design','text':'Architectural concepts, plans, drawings and visualization.','cta':'Start an enquiry →','href':'/quote'},{'icon':'','imageCode':'','title':'Planning & Approvals','text':'Planning applications, approvals and regulatory support.','cta':'Start an enquiry →','href':'/quote'},{'icon':'','imageCode':'','title':'Project Consultancy','text':'Project planning, coordination and monitoring.','cta':'Start an enquiry →','href':'/quote'}]),
+        'home.workflow':json.dumps({'eyebrow':'A CLEARER WORKFLOW','title':'From first question to project delivery.','text':'Get structured support for feasibility, planning, design, approvals and coordination without losing sight of the commercial objective.','features':['Defined scope and deliverables','Transparent communication','Secure enquiries and member workflows','Google Drive-backed document access'],'imageCode':''}),
+        'home.approach':json.dumps({'eyebrow':'OUR APPROACH','title':'Clear, practical, accountable.','text':'We focus on responsible documentation, transparent communication, coordinated project delivery and advice that can be acted on.','imageCode':''}),
+        'home.mission':json.dumps({'eyebrow':'MISSION','title':'Move projects forward.','text':'Our consultancy workflow is designed to reduce uncertainty from early land and planning decisions through design and development.','imageCode':''}),
+        'home.startProject':json.dumps({'eyebrow':'START A PROJECT','title':'Ready to move your project forward?','text':'Tell us what you are planning and the GLDC team can guide the next step.','cta':'GET A CONSULTATION','href':'/quote'}),
+        'site.company':'Gavin Land & Design Consultants','site.tagline':'Land • Design • Development • Consultancy','site.phone':'+254','site.email':'info@yourdomain.co.ke','site.location':'Kenya'
+    }
     for key,value in defaults.items(): db.content.update_one({'key':key},{'$setOnInsert':{'key':key,'value':value,'public':True,'createdAt':now()}},upsert=True)
     db.tasks.create_index([('projectId',ASCENDING),('status',ASCENDING)])
     for collection in ['services','site_projects','team','testimonials','posts','service_areas','faqs','pages']:
