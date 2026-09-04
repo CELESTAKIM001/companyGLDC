@@ -25,3 +25,13 @@ Visitor → Enquiry → Consultation → Proposal/Quote → Client → Project �
 ## Important
 The application contains no production secrets. Configure the supplied Python environment through hosting environment variables.
 Real GLDC content, projects, staff, testimonials and media should be entered through the CMS when supplied; the requirements prohibit fake business information.
+
+## V16 Membership Renewal + Map Viewer
+- Membership registration visibly progresses through account creation, email OTP, email verification, plan selection, M-Pesa payment, review and certificate issuance.
+- Membership periods use calendar-month arithmetic: valid-until is activation/renewal date plus configured plan months minus one day.
+- Renewal opens according to the configurable `renewalWindowDays` policy (default 30 days), and expired memberships can renew.
+- Renewal payments are recorded separately and a new certificate is issued only after verified payment and admin approval.
+- Previous certificates are preserved in `membership_certificates` history and marked expired when replaced.
+- Certificate QR codes resolve to a public verification page showing the exact member, plan, certificate number and validity period.
+- Public `/locations` is an interactive map viewer with Street/OpenStreetMap and Terrain layers.
+- Member Portal includes an optional saved location map viewer.

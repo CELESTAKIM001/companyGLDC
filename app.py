@@ -1,5 +1,5 @@
 import os, re, json, base64, hashlib, secrets, smtplib, time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 from functools import wraps
 from email.message import EmailMessage
 from io import BytesIO
@@ -68,6 +68,44 @@ db = mongo_client[MONGO_DB] if mongo_client is not None else None
 
 
 def now(): return datetime.now(timezone.utc)
+
+def add_calendar_months(value, months):
+    if isinstance(value, datetime): base_date=value.date()
+    else: base_date=value
+    total=base_date.year*12 + base_date.month-1 + int(months)
+    year, month0=divmod(total,12); month=month0+1
+    import calendar
+    return datetime(year,month,min(base_date.day,calendar.monthrange(year,month)[1]),tzinfo=timezone.utc)
+
+def membership_period(valid_from, months):
+    start=valid_from if isinstance(valid_from,datetime) else datetime.combine(valid_from,datetime.min.time(),tzinfo=timezone.utc)
+    return start, add_calendar_months(start,int(months))-timedelta(days=1)
+
+def renewal_window_days():
+    try:
+        x=db.settings.find_one({'key':'membership_policy'}) if db is not None else None
+        return int((x or {}).get('renewalWindowDays', env('MEMBERSHIP_RENEWAL_WINDOW_DAYS',default='30')))
+    except Exception:
+        return int(env('MEMBERSHIP_RENEWAL_WINDOW_DAYS',default='30'))
+
+def membership_state(member):
+    status=str(member.get('status','')).upper(); until=member.get('validUntil')
+    if status in {'ACTIVE','EXPIRING_SOON','EXPIRED'} and until:
+        try:
+            if until.tzinfo is None: until=until.replace(tzinfo=timezone.utc)
+            days=(until.date()-now().date()).days; window=renewal_window_days()
+            if days < 0: return 'EXPIRED'
+            if days <= window: return 'EXPIRING_SOON'
+            return 'ACTIVE'
+        except Exception: pass
+    return status
+
+def sync_membership_state(member):
+    state=membership_state(member)
+    if state in {'ACTIVE','EXPIRING_SOON','EXPIRED'} and state != member.get('status'):
+        try: db.members.update_one({'_id':member['_id']},{'$set':{'status':state,'updatedAt':now()}}); member['status']=state
+        except Exception: pass
+    return member
 def oid(x):
     try:
         from bson import ObjectId
@@ -221,9 +259,10 @@ def build_receipt_pdf(payment, membership=None):
     c.setFont('Helvetica',9); c.drawString(22*mm,35*mm,'This receipt confirms payment was recorded. Membership remains subject to GLDC review and approval.')
     c.save(); return buf.getvalue()
 
-def build_membership_certificate(member, plan, certificate_no):
-    buf=BytesIO(); c=canvas.Canvas(buf,pagesize=A4); w,h=A4
-    c.setTitle(certificate_no)
+def build_membership_certificate(member, plan, certificate_no, valid_from=None, valid_until=None, issue_date=None):
+    buf=BytesIO(); c=canvas.Canvas(buf,pagesize=A4); w,h=A4; c.setTitle(certificate_no)
+    valid_from=valid_from or member.get('validFrom'); valid_until=valid_until or member.get('validUntil'); issue_date=issue_date or now()
+    def d(v): return str(v)[:10] if v else ''
     c.setLineWidth(2); c.rect(14*mm,14*mm,w-28*mm,h-28*mm); c.setLineWidth(.6); c.rect(19*mm,19*mm,w-38*mm,h-38*mm)
     logo_path=os.path.join(os.path.dirname(__file__),'static','assets','gldc-logo.png')
     try: c.drawImage(ImageReader(logo_path),w/2-25*mm,h-38*mm,width=50*mm,height=25*mm,mask='auto')
@@ -235,10 +274,10 @@ def build_membership_certificate(member, plan, certificate_no):
     c.setFont('Helvetica',11); c.drawCentredString(w/2,h-113*mm,'is an approved member of GLDC under the following membership plan:')
     c.setFont('Helvetica-Bold',14); c.drawCentredString(w/2,h-130*mm,str(plan.get('name',''))[:60])
     c.setFont('Helvetica',10); c.drawCentredString(w/2,h-145*mm,f"Membership No: {member.get('membershipNumber',member.get('id',''))}")
-    c.drawCentredString(w/2,h-153*mm,f"Valid: {str(member.get('validFrom',''))[:10]} to {str(member.get('validUntil',''))[:10]}")
-    c.drawCentredString(w/2,h-161*mm,f"Certificate: {certificate_no}")
-    _draw_qr(c,f"{APP_URL}/members/{member.get('profileSlug','')}",w/2-15*mm,34*mm,30*mm)
-    c.setFont('Helvetica',8); c.drawCentredString(w/2,29*mm,'Scan to view the member profile / verify certificate.')
+    c.drawCentredString(w/2,h-153*mm,f"Valid: {d(valid_from)} to {d(valid_until)}")
+    c.drawCentredString(w/2,h-161*mm,f"Certificate: {certificate_no}   •   Issued: {d(issue_date)}")
+    _draw_qr(c,f"{APP_URL}/membership/certificate/{certificate_no}",w/2-15*mm,31*mm,30*mm)
+    c.setFont('Helvetica',8); c.drawCentredString(w/2,27*mm,'Scan to verify this certificate and its membership period.')
     c.save(); return buf.getvalue()
 
 def email_template_render(name, variables):
@@ -984,12 +1023,21 @@ def api_stats():
 @admin_required
 def api_settings():
     s=db.settings.find_one({'key':'public'}) or {}
-    return jsonify(ok=True,settings={'currency':CURRENCY,'timezone':APP_TIMEZONE,'appUrl':APP_URL,'adminPath':ADMIN_PATH,'darajaEnvironment':str(env('DARAJA_ENV','DARAJA_ENVIRONMENT', default='production')),'smtpConfigured':bool(env('SMTP_HOST') and env('SMTP_USER','GMAIL_USER') and env('SMTP_PASSWORD','GMAIL_APP_PASSWORD') and env('SMTP_FROM','EMAIL_FROM_ADDRESS')),'googleDriveConfigured':env_bool('GOOGLE_DRIVE_ENABLED', default=True) and bool(env('GOOGLE_DRIVE_FOLDER_ID')),'googleDriveAuth':'service-account','googleSheetsConfigured':env_bool('GOOGLE_SHEETS_ENABLED', default=False) and bool(env('GOOGLE_SPREADSHEET_ID')),'mongodbConfigured':bool(MONGO_URI),'paymentsEnabled':PAYMENTS_ENABLED,'membershipEnabled':MEMBERSHIP_ENABLED,'documentStorage':DOCUMENT_STORAGE,'pdfEnabled':PDF_ENABLED,'public':{k:s.get(k,'') for k in ['company','phone','email','location','hours','tagline']}})
+    policy=db.settings.find_one({'key':'membership_policy'}) or {}; return jsonify(ok=True,settings={'currency':CURRENCY,'timezone':APP_TIMEZONE,'appUrl':APP_URL,'adminPath':ADMIN_PATH,'darajaEnvironment':str(env('DARAJA_ENV','DARAJA_ENVIRONMENT', default='production')),'smtpConfigured':bool(env('SMTP_HOST') and env('SMTP_USER','GMAIL_USER') and env('SMTP_PASSWORD','GMAIL_APP_PASSWORD') and env('SMTP_FROM','EMAIL_FROM_ADDRESS')),'googleDriveConfigured':env_bool('GOOGLE_DRIVE_ENABLED', default=True) and bool(env('GOOGLE_DRIVE_FOLDER_ID')),'googleDriveAuth':'service-account','googleSheetsConfigured':env_bool('GOOGLE_SHEETS_ENABLED', default=False) and bool(env('GOOGLE_SPREADSHEET_ID')),'mongodbConfigured':bool(MONGO_URI),'paymentsEnabled':PAYMENTS_ENABLED,'membershipEnabled':MEMBERSHIP_ENABLED,'documentStorage':DOCUMENT_STORAGE,'pdfEnabled':PDF_ENABLED,'renewalWindowDays':int(policy.get('renewalWindowDays',renewal_window_days())),'public':{k:s.get(k,'') for k in ['company','phone','email','location','hours','tagline']}})
 
 @app.post('/api/admin/settings')
 @admin_required
 def api_settings_save():
-    b=request.get_json(force=True) or {}; allowed={k:str(b.get(k,'')).strip()[:200] for k in ['company','phone','email','location','hours','tagline']}; db.settings.update_one({'key':'public'},{'$set':{**allowed,'key':'public','updatedAt':now()}},upsert=True); return jsonify(ok=True)
+    b=request.get_json(force=True) or {}
+    allowed={k:str(b.get(k,'')).strip()[:200] for k in ['company','phone','email','location','hours','tagline'] if k in b}
+    if allowed: db.settings.update_one({'key':'public'},{'$set':{**allowed,'key':'public','updatedAt':now()}},upsert=True)
+    if 'renewalWindowDays' in b:
+        try: days=int(b.get('renewalWindowDays',30) or 30)
+        except Exception: return json_error('Renewal window must be a whole number of days.',422,'VALIDATION_ERROR')
+        if days<0 or days>365: return json_error('Renewal window must be between 0 and 365 days.',422,'VALIDATION_ERROR')
+        db.settings.update_one({'key':'membership_policy'},{'$set':{'renewalWindowDays':days,'updatedAt':now(),'updatedBy':current_user().get('email')}},upsert=True)
+    audit('SYSTEM_SETTINGS_UPDATED','settings','public',{'renewalWindowDays':b.get('renewalWindowDays')})
+    return jsonify(ok=True,renewalWindowDays=renewal_window_days())
 
 @app.get('/api/admin/content')
 @admin_required
@@ -1094,6 +1142,7 @@ def api_callback():
             m=db.members.find_one({'id':p.get('memberId')}); plan=db.membership_plans.find_one({'id':p.get('planId')})
             if m:
                 db.members.update_one({'_id':m['_id']},{'$set':{'status':'PENDING_REVIEW','paymentId':p['id'],'paymentReceiptCode':p.get('receiptCode'),'updatedAt':now()}})
+                if p.get('renewalId'): db.membership_renewals.update_one({'id':p['renewalId']},{'$set':{'status':'PENDING_REVIEW','paidAt':now(),'updatedAt':now()}})
                 p.update(update)
                 try:
                     receipt=build_receipt_pdf(p,m); _send_member_email('membership_payment_receipt',m,{'name':m.get('name',''),'plan':p.get('planName',''),'amount':p.get('amount'),'receiptCode':p.get('receiptCode'),'subject':'GLDC Membership Payment Receipt','text':f'We received your membership payment. Receipt: {p.get("receiptCode")}.','html':f'<div style="font-family:Arial;max-width:640px;margin:auto"><h2 style="color:#8B4A18">Payment received</h2><p>Dear {m.get("name","")},</p><p>Your payment for <b>{p.get("planName","")}</b> has been received and your application is now awaiting GLDC review.</p><p><b>Receipt:</b> {p.get("receiptCode")}<br><b>Amount:</b> KES {float(p.get("amount",0)):,.2f}</p><p>Your payment receipt is attached.</p></div>'},[('GLDC-Receipt-'+str(p.get('receiptCode'))+'.pdf',receipt,'application/pdf')])
@@ -1188,13 +1237,37 @@ def member_dashboard():
 def member_portal_api():
     m=_member_doc()
     if not m: return json_error('Member authentication required.',401,'UNAUTHORIZED')
-    member_id=m.get('id')
+    m=sync_membership_state(m); member_id=m.get('id')
     docs=[clean_doc(x) for x in db.member_documents.find({'memberId':member_id}).sort('createdAt',DESCENDING).limit(100)]
     payments=[clean_doc(x) for x in db.payments.find({'memberId':member_id}).sort('createdAt',DESCENDING).limit(100)]
     leads=[clean_doc(x) for x in db.leads.find({'memberId':member_id}).sort('createdAt',DESCENDING).limit(100)]
     notifications=[clean_doc(x) for x in db.notifications.find({'memberId':member_id}).sort('createdAt',DESCENDING).limit(100)]
     plans=[clean_doc(x) for x in db.membership_plans.find({'status':'ACTIVE'}).sort('sortOrder',ASCENDING)]
-    return jsonify(ok=True,member=_member_public(m)|{'bio':m.get('bio',''),'profession':m.get('profession',''),'company':m.get('company',''),'location':m.get('location',''),'portfolioUrl':m.get('portfolioUrl',''),'certificateNumber':m.get('certificateNumber'),'certificateDriveId':m.get('certificateDriveId')},documents=docs,payments=payments,leads=leads,notifications=notifications,plans=plans)
+    certificates=[clean_doc(x) for x in db.membership_certificates.find({'memberId':member_id}).sort('issuedAt',DESCENDING).limit(100)]
+    renewals=[clean_doc(x) for x in db.membership_renewals.find({'memberId':member_id}).sort('createdAt',DESCENDING).limit(100)]
+    state=membership_state(m); window=renewal_window_days()
+    pending=any(str(x.get('status','')).upper() in {'PENDING_PAYMENT','PENDING_REVIEW'} for x in renewals)
+    return jsonify(ok=True,member=_member_public(m)|{'status':state,'bio':m.get('bio',''),'profession':m.get('profession',''),'company':m.get('company',''),'location':m.get('location',''),'locationLat':m.get('locationLat'),'locationLng':m.get('locationLng'),'portfolioUrl':m.get('portfolioUrl',''),'certificateNumber':m.get('certificateNumber'),'certificateDriveId':m.get('certificateDriveId'),'renewalAvailable':state in {'EXPIRING_SOON','EXPIRED'} and not pending,'renewalWindowDays':window},documents=docs,payments=payments,leads=leads,notifications=notifications,plans=plans,certificates=certificates,renewals=renewals)
+
+@app.get('/membership/certificate/<certificate_no>')
+def membership_certificate_verify_page(certificate_no):
+    c=db.membership_certificates.find_one({'certificateNumber':certificate_no}) if db is not None else None
+    if not c: return render_template('404.html',title='Certificate not found'),404
+    return render_template('membership_certificate_verify.html',title='Certificate Verification',certificate=clean_doc(c))
+
+@app.get('/api/membership/certificate/<certificate_no>')
+def membership_certificate_verify_api(certificate_no):
+    c=db.membership_certificates.find_one({'certificateNumber':certificate_no}) if db is not None else None
+    if not c: return json_error('Certificate not found.',404,'CERTIFICATE_NOT_FOUND')
+    return jsonify(ok=True,certificate=clean_doc(c))
+
+@app.get('/api/member/certificates/<certificate_no>/download')
+def member_certificate_history_download(certificate_no):
+    m=_member_doc(); c=db.membership_certificates.find_one({'certificateNumber':certificate_no,'memberId':m.get('id')}) if m else None
+    if not c or not c.get('driveFileId'): return json_error('Certificate is not available.',404,'CERTIFICATE_NOT_AVAILABLE')
+    try:
+        data=drive_download_bytes_by_id(c['driveFileId']); return Response(data,mimetype='application/pdf',headers={'Content-Disposition':f'inline; filename="GLDC-{certificate_no}.pdf"'})
+    except Exception: return json_error('Unable to retrieve certificate.',503,'CERTIFICATE_DOWNLOAD_FAILED')
 
 @app.get('/api/member/certificate')
 def member_certificate_download():
@@ -1220,8 +1293,19 @@ def membership_register_v14():
     b=request.get_json(silent=True) or {}; name=str(b.get('name','')).strip(); email=str(b.get('email','')).strip().lower(); phone=str(b.get('phone','')).strip()
     if len(name)<2 or '@' not in email or len(phone)<7: return json_error('Name, valid email and phone are required.',422,'VALIDATION_ERROR')
     if db.members.find_one({'email':email,'status':{'$in':['ACTIVE','PENDING_PAYMENT','PENDING_REVIEW','APPROVED']}}): return json_error('A membership account already exists for this email.',409,'MEMBER_EXISTS')
-    member={'id':make_id('MEM'),'membershipNumber':'PENDING-'+secrets.token_hex(4).upper(),'name':name,'email':email,'phone':phone,'profileSlug':_slugify(name)+'-'+secrets.token_hex(3),'status':'EMAIL_PENDING','emailVerified':False,'createdAt':now(),'updatedAt':now(),'bio':str(b.get('bio','')).strip(),'profession':str(b.get('profession','')).strip(),'company':str(b.get('company','')).strip(),'location':str(b.get('location','')).strip(),'portfolioUrl':str(b.get('portfolioUrl','')).strip()}
+    member={'id':make_id('MEM'),'membershipNumber':'PENDING-'+secrets.token_hex(4).upper(),'name':name,'email':email,'phone':phone,'profileSlug':_slugify(name)+'-'+secrets.token_hex(3),'status':'EMAIL_PENDING','emailVerified':False,'createdAt':now(),'updatedAt':now(),'bio':str(b.get('bio','')).strip(),'profession':str(b.get('profession','')).strip(),'company':str(b.get('company','')).strip(),'location':str(b.get('location','')).strip(),'locationLat':float(b['locationLat']) if str(b.get('locationLat','')).strip() else None,'locationLng':float(b['locationLng']) if str(b.get('locationLng','')).strip() else None,'portfolioUrl':str(b.get('portfolioUrl','')).strip()}
     db.members.insert_one(member); request_otp(email); audit('MEMBERSHIP_REGISTERED','member',member['id']); return jsonify(ok=True,memberId=member['id'],message='Verification code sent to your email.')
+
+@app.post('/api/membership/resend-otp')
+def membership_resend_otp():
+    try:
+        b=request.get_json(silent=True) or {}; email=str(b.get('email','')).strip().lower(); m=db.members.find_one({'email':email,'status':'EMAIL_PENDING'}) if db is not None else None
+        if not m: return json_error('Registration session not found or email is already verified.',404,'REGISTRATION_NOT_FOUND')
+        request_otp(email); return jsonify(ok=True,message='A new verification code has been sent.')
+    except RuntimeError as e:
+        if str(e)=='OTP_COOLDOWN': return json_error('Please wait before requesting another code.',429,'OTP_COOLDOWN')
+        return json_error('Unable to resend the verification code.',503,'OTP_SEND_FAILED')
+    except Exception: return json_error('Unable to resend the verification code.',503,'OTP_SEND_FAILED')
 
 @app.post('/api/membership/verify')
 def membership_verify_v14():
@@ -1239,7 +1323,7 @@ def membership_verify_v14():
 def membership_profile_update():
     m=_member_doc()
     if not m: return json_error('Member account not found.',404,'MEMBER_NOT_FOUND')
-    b=request.get_json(silent=True) or {}; allowed=['name','phone','bio','profession','company','location','portfolioUrl']
+    b=request.get_json(silent=True) or {}; allowed=['name','phone','bio','profession','company','location','locationLat','locationLng','portfolioUrl']
     update={k:str(b[k]).strip() for k in allowed if k in b}; update['updatedAt']=now(); update['profileSlug']=_slugify(update.get('name',m.get('name','')))+'-'+str(m.get('id',''))[-6:].lower()
     db.members.update_one({'_id':m['_id']},{'$set':update}); audit('MEMBER_PROFILE_UPDATED','member',m['id']); return jsonify(ok=True,member=_member_public({**m,**update}))
 
@@ -1282,19 +1366,28 @@ def member_photo(member_id):
 def membership_subscribe():
     m=_member_doc()
     if not m or not m.get('emailVerified'): return json_error('Verify your email before subscribing.',403,'EMAIL_NOT_VERIFIED')
-    b=request.get_json(silent=True) or {}; plan=_membership_plan(str(b.get('planId','')))
+    m=sync_membership_state(m); b=request.get_json(silent=True) or {}; plan=_membership_plan(str(b.get('planId','')))
     if not plan: return json_error('Membership plan not found.',404,'PLAN_NOT_FOUND')
-    if m.get('status') not in {'PENDING_PAYMENT','PAYMENT_FAILED','EMAIL_PENDING'}: return json_error('This membership is already in review or active.',409,'MEMBERSHIP_STATE')
-    amount=float(plan['price']); pid=make_id('PAY'); receipt='GLDC-RCP-'+secrets.token_hex(5).upper()
-    pay={'id':pid,'memberId':m['id'],'email':m['email'],'phone':m['phone'],'amount':amount,'currency':'KES','planId':plan['id'],'planName':plan['name'],'method':'M-PESA','status':'PENDING','receiptCode':receipt,'createdAt':now(),'updatedAt':now(),'source':'MEMBERSHIP'}
+    state=membership_state(m); is_renewal=state in {'ACTIVE','EXPIRING_SOON','EXPIRED'} or m.get('status')=='RENEWAL_PENDING'
+    if not is_renewal and state not in {'PENDING_PAYMENT','PAYMENT_FAILED','EMAIL_PENDING'}: return json_error('This membership is not ready for a new payment.',409,'MEMBERSHIP_STATE')
+    if state=='ACTIVE':
+        window=renewal_window_days(); until=m.get('validUntil'); days=(until.date()-now().date()).days if until else 9999
+        if days>window: return json_error(f'Renewal opens {window} days before expiry.',409,'RENEWAL_NOT_OPEN')
+    purpose='RENEWAL' if is_renewal else 'INITIAL'; amount=float(plan['price']); pid=make_id('PAY'); receipt='GLDC-RCP-'+secrets.token_hex(5).upper(); renewal_id=make_id('REN') if is_renewal else None
+    pay={'id':pid,'memberId':m['id'],'email':m['email'],'phone':m['phone'],'amount':amount,'currency':plan.get('currency','KES'),'planId':plan['id'],'planName':plan['name'],'method':'M-PESA','status':'PENDING','receiptCode':receipt,'purpose':'MEMBERSHIP_'+purpose,'renewalId':renewal_id,'createdAt':now(),'updatedAt':now(),'source':'MEMBERSHIP'}
     db.payments.insert_one(pay)
+    if renewal_id: db.membership_renewals.insert_one({'id':renewal_id,'memberId':m['id'],'paymentId':pid,'planId':plan['id'],'planName':plan['name'],'status':'PENDING_PAYMENT','createdAt':now(),'updatedAt':now()})
     try:
-        r=daraja_stk(m['phone'],int(amount),m['membershipNumber'],f"GLDC {plan['name']} membership")
+        r=daraja_stk(m['phone'],int(amount),m['membershipNumber'],f"GLDC {plan['name']} membership {purpose.lower()}")
         db.payments.update_one({'id':pid},{'$set':{'merchantRequestId':r.get('MerchantRequestID'),'checkoutRequestId':r.get('CheckoutRequestID'),'responseDescription':r.get('ResponseDescription')}})
-        db.members.update_one({'_id':m['_id']},{'$set':{'status':'PAYMENT_PENDING','membershipPlan':plan['name'],'membershipPlanId':plan['id'],'updatedAt':now()}})
-        return jsonify(ok=True,paymentId=pid,receiptCode=receipt,status='PENDING',message=r.get('CustomerMessage','Payment prompt sent.'))
+        db.members.update_one({'_id':m['_id']},{'$set':{'status':'RENEWAL_PENDING' if is_renewal else 'PAYMENT_PENDING','membershipPlan':plan['name'],'membershipPlanId':plan['id'],'updatedAt':now()}})
+        if renewal_id: db.membership_renewals.update_one({'id':renewal_id},{'$set':{'status':'PAYMENT_PENDING','updatedAt':now()}})
+        return jsonify(ok=True,paymentId=pid,renewalId=renewal_id,receiptCode=receipt,status='PENDING',purpose=purpose,message=r.get('CustomerMessage','Payment prompt sent.'))
     except Exception as e:
-        db.payments.update_one({'id':pid},{'$set':{'status':'FAILED','updatedAt':now(),'error':str(e)}}); db.members.update_one({'_id':m['_id']},{'$set':{'status':'PAYMENT_FAILED','updatedAt':now()}}); return json_error('Unable to start membership payment.',502,'PAYMENT_FAILED')
+        db.payments.update_one({'id':pid},{'$set':{'status':'FAILED','updatedAt':now(),'error':str(e)}})
+        if renewal_id: db.membership_renewals.update_one({'id':renewal_id},{'$set':{'status':'PAYMENT_FAILED','updatedAt':now()}})
+        db.members.update_one({'_id':m['_id']},{'$set':{'status':'PAYMENT_FAILED' if not is_renewal else state,'updatedAt':now()}})
+        return json_error('Unable to start membership payment.',502,'PAYMENT_FAILED')
 
 @app.get('/api/admin/membership/plans')
 @admin_required
@@ -1315,7 +1408,10 @@ def admin_membership_plan_update(plan_id):
 
 @app.get('/api/admin/members')
 @admin_required
-def admin_members_v14(): return jsonify(ok=True,members=list_collection('members',500))
+def admin_members_v14():
+    xs=list(db.members.find({}).sort('createdAt',DESCENDING).limit(500)); out=[]
+    for x in xs: out.append(clean_doc(sync_membership_state(x)))
+    return jsonify(ok=True,members=out)
 
 @app.post('/api/admin/members/<member_id>/decision')
 @admin_required
@@ -1326,14 +1422,32 @@ def admin_member_decision(member_id):
     if decision=='APPROVE':
         plan=_membership_plan(m.get('membershipPlanId','')) or db.membership_plans.find_one({'name':m.get('membershipPlan')})
         if not plan: return json_error('Membership plan not found.',409,'PLAN_NOT_FOUND')
-        from_date=now(); valid=from_date+timedelta(days=30*int(plan.get('months',1))); cert='GLDC-CERT-'+secrets.token_hex(5).upper(); number='GLDC-M-'+secrets.token_hex(4).upper()
-        update={'status':'ACTIVE','membershipNumber':number,'validFrom':from_date,'validUntil':valid,'certificateNumber':cert,'approvedAt':now(),'approvedBy':current_user().get('email'),'updatedAt':now()}
-        db.members.update_one({'_id':m['_id']},{'$set':update}); m.update(update); pdf=build_membership_certificate(m,plan,cert)
-        try: drive=drive_upload_bytes(f'{cert}.pdf',pdf,'application/pdf'); db.members.update_one({'_id':m['_id']},{'$set':{'certificateDriveId':drive.get('id')}})
+        old_certificate_number=m.get('certificateNumber')
+        is_renewal=bool(m.get('paymentId') and db.payments.find_one({'id':m.get('paymentId'),'purpose':'MEMBERSHIP_RENEWAL'}))
+        issue_date=now()
+        if is_renewal and m.get('validUntil'):
+            base=m.get('validUntil'); base=base.replace(tzinfo=timezone.utc) if getattr(base,'tzinfo',None) is None else base
+            from_date=max(issue_date,base+timedelta(days=1))
+            number=m.get('membershipNumber') or 'GLDC-M-'+secrets.token_hex(4).upper()
+        else:
+            from_date=issue_date; number='GLDC-M-'+secrets.token_hex(4).upper()
+        from_date,valid=membership_period(from_date,int(plan.get('months',1))); cert='GLDC-CERT-'+secrets.token_hex(5).upper()
+        update={'status':'ACTIVE','membershipNumber':number,'validFrom':from_date,'validUntil':valid,'certificateNumber':cert,'approvedAt':issue_date,'approvedBy':current_user().get('email'),'updatedAt':issue_date}
+        db.members.update_one({'_id':m['_id']},{'$set':update}); m.update(update)
+        if is_renewal and old_certificate_number:
+            db.membership_certificates.update_one({'certificateNumber':old_certificate_number,'memberId':m['id']},{'$set':{'status':'EXPIRED','expiredAt':issue_date,'updatedAt':issue_date}})
+        cert_doc={'id':make_id('CERT'),'certificateNumber':cert,'memberId':m['id'],'membershipNumber':number,'memberName':m.get('name',''),'planId':plan['id'],'planName':plan['name'],'validFrom':from_date,'validUntil':valid,'issuedAt':issue_date,'status':'ACTIVE','replacesCertificateNumber':old_certificate_number if is_renewal else None,'createdAt':issue_date}
+        pdf=build_membership_certificate(m,plan,cert,from_date,valid,issue_date)
+        try:
+            drive=drive_upload_bytes(f'{cert}.pdf',pdf,'application/pdf'); cert_doc['driveFileId']=drive.get('id'); db.members.update_one({'_id':m['_id']},{'$set':{'certificateDriveId':drive.get('id')}})
         except Exception: app.logger.exception('Certificate Drive archive failed')
-        _send_member_email('membership_certificate',m,{'name':m['name'],'membershipNumber':number,'plan':plan['name'],'validUntil':str(valid)[:10],'certificateNumber':cert,'subject':'Your GLDC Membership Certificate','text':f'Congratulations {m["name"]}. Your GLDC membership has been approved.','html':f'<div style="font-family:Arial;max-width:640px;margin:auto"><h2 style="color:#8B4A18">Welcome to GLDC Membership</h2><p>Dear {m["name"]},</p><p>Your membership has been approved and your certificate is attached.</p><p><b>Membership:</b> {plan["name"]}<br><b>Membership No:</b> {number}<br><b>Valid until:</b> {str(valid)[:10]}</p><p>Keep your certificate for your records.</p><p style="color:#777">Gavin Land & Design Consultants</p></div>'},[('GLDC-'+cert+'.pdf',pdf,'application/pdf')])
+        db.membership_certificates.insert_one(cert_doc)
+        if is_renewal and m.get('paymentId'): db.membership_renewals.update_one({'paymentId':m.get('paymentId')},{'$set':{'status':'APPROVED','certificateNumber':cert,'validFrom':from_date,'validUntil':valid,'approvedAt':issue_date,'approvedBy':current_user().get('email'),'updatedAt':issue_date}})
+        _send_member_email('membership_certificate',m,{'name':m['name'],'membershipNumber':number,'plan':plan['name'],'validUntil':str(valid)[:10],'certificateNumber':cert,'subject':'Your GLDC Membership Certificate','text':f'Your GLDC membership has been approved. Certificate {cert}.','html':f'<div style="font-family:Arial;max-width:640px;margin:auto"><h2 style="color:#8B4A18">Membership Approved</h2><p>Dear {m["name"]},</p><p>Your {"renewal" if is_renewal else "membership"} has been approved.</p><p><b>Membership No:</b> {number}<br><b>Plan:</b> {plan["name"]}<br><b>Valid:</b> {str(from_date)[:10]} to {str(valid)[:10]}<br><b>Certificate:</b> {cert}</p></div>'},[('GLDC-'+cert+'.pdf',pdf,'application/pdf')])
     else:
-        status='CHANGES_REQUIRED' if decision=='REQUEST_CHANGES' else 'REJECTED'; note=str(b.get('message','Please review and update your membership details.')).strip(); db.members.update_one({'_id':m['_id']},{'$set':{'status':status,'adminMessage':note,'updatedAt':now()}}); edit_url=f'{APP_URL}/member/dashboard?edit=1'; _send_member_email('membership_changes',m,{'name':m['name'],'message':note,'editUrl':edit_url,'subject':'GLDC Membership – action required','text':f'Please review your membership details: {edit_url}','html':f'<div style="font-family:Arial;max-width:640px;margin:auto"><h2 style="color:#8B4A18">Membership details need your attention</h2><p>Dear {m["name"]},</p><p>{note}</p><p><a href="{edit_url}" style="display:inline-block;padding:12px 18px;background:#8B4A18;color:white;text-decoration:none;border-radius:6px">EDIT MY DETAILS</a></p></div>'})
+        status='CHANGES_REQUIRED' if decision=='REQUEST_CHANGES' else 'REJECTED'; note=str(b.get('message','Please review and update your membership details.')).strip(); db.members.update_one({'_id':m['_id']},{'$set':{'status':status,'adminMessage':note,'updatedAt':now()}})
+        if m.get('paymentId') and db.payments.find_one({'id':m.get('paymentId'),'purpose':'MEMBERSHIP_RENEWAL'}): db.membership_renewals.update_one({'paymentId':m.get('paymentId')},{'$set':{'status':status,'adminMessage':note,'updatedAt':now()}})
+        edit_url=f'{APP_URL}/member/dashboard?edit=1'; _send_member_email('membership_changes',m,{'name':m['name'],'message':note,'editUrl':edit_url,'subject':'GLDC Membership – action required','text':f'Please review your membership details: {edit_url}','html':f'<div style="font-family:Arial;max-width:640px;margin:auto"><h2 style="color:#8B4A18">Membership details need your attention</h2><p>Dear {m["name"]},</p><p>{note}</p><p><a href="{edit_url}">EDIT MY DETAILS</a></p></div>'})
     audit('MEMBERSHIP_DECISION','member',member_id,{'decision':decision}); return jsonify(ok=True,status='ACTIVE' if decision=='APPROVE' else ('CHANGES_REQUIRED' if decision=='REQUEST_CHANGES' else 'REJECTED'))
 
 @app.get('/api/admin/membership/recover/<receipt_code>')
@@ -1342,6 +1456,14 @@ def admin_membership_recover(receipt_code):
     p=db.payments.find_one({'receiptCode':receipt_code});
     if not p: return json_error('Payment receipt not found.',404,'RECEIPT_NOT_FOUND')
     m=db.members.find_one({'id':p.get('memberId')}); return jsonify(ok=True,payment=clean_doc(p),member=clean_doc(m) if m else None)
+
+@app.get('/api/admin/membership/renewals')
+@admin_required
+def admin_membership_renewals(): return jsonify(ok=True,renewals=list_collection('membership_renewals',500))
+
+@app.get('/api/admin/membership/certificates')
+@admin_required
+def admin_membership_certificates(): return jsonify(ok=True,certificates=list_collection('membership_certificates',500))
 
 @app.get('/api/admin/email-templates')
 @admin_required
@@ -1737,6 +1859,10 @@ def init_database():
     db.posts.create_index([('status',ASCENDING),('publishedAt',DESCENDING)])
     db.consultations.create_index([('scheduledAt',ASCENDING),('status',ASCENDING)])
     db.membership_plans.create_index([('status',ASCENDING),('sortOrder',ASCENDING)])
+    db.membership_certificates.create_index([('certificateNumber',ASCENDING)], unique=True)
+    db.membership_certificates.create_index([('memberId',ASCENDING),('issuedAt',DESCENDING)])
+    db.membership_renewals.create_index([('memberId',ASCENDING),('createdAt',DESCENDING)])
+    db.membership_renewals.create_index([('paymentId',ASCENDING)], unique=True, sparse=True)
     db.member_documents.create_index([('memberId',ASCENDING),('category',ASCENDING),('createdAt',DESCENDING)])
     db.email_templates.create_index([('name',ASCENDING)], unique=True)
     db.media.create_index([('slot',ASCENDING)], unique=True)
@@ -1752,6 +1878,7 @@ def init_database():
       'membership_certificate':{'subject':'Your GLDC Membership Certificate – {{certificateNumber}}','text':'Congratulations {{name}}. Your GLDC membership certificate is attached.','html':'<div style=\"font-family:Arial;max-width:640px;margin:auto\"><div style=\"padding:24px;background:#8B4A18;color:#fff\"><h2>Membership Approved</h2></div><div style=\"padding:24px\"><p>Dear <b>{{name}}</b>,</p><p>Your GLDC membership has been approved. Your certificate is attached.</p><p><b>Plan:</b> {{plan}}<br><b>Membership No:</b> {{membershipNumber}}<br><b>Valid until:</b> {{validUntil}}</p></div></div>'}
     }
     for name,t in email_defaults.items(): db.email_templates.update_one({'name':name},{'$setOnInsert':{'name':name,'createdAt':now()},'$set':t},upsert=True)
+    db.settings.update_one({'key':'membership_policy'},{'$setOnInsert':{'key':'membership_policy','renewalWindowDays':30,'createdAt':now()}},upsert=True)
     defaults={'home.heroTitle':'Land. Design. Development. Done Right.','home.heroText':'Professional land, planning, design and development consultancy for clients who need practical outcomes.','home.primaryCta':'REQUEST A QUOTE','home.secondaryCta':'VIEW PROJECTS','site.company':'Gavin Land & Design Consultants','site.tagline':'Land • Design • Development • Consultancy','site.phone':'+254','site.email':'info@yourdomain.co.ke','site.location':'Kenya'}
     for key,value in defaults.items(): db.content.update_one({'key':key},{'$setOnInsert':{'key':key,'value':value,'public':True,'createdAt':now()}},upsert=True)
     db.tasks.create_index([('projectId',ASCENDING),('status',ASCENDING)])
