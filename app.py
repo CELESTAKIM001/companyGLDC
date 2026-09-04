@@ -1615,15 +1615,23 @@ def membership_register_v14():
         existing=db.members.find_one({'email':email})
         if existing:
             status=str(existing.get('status','')).upper()
-            if status=='EMAIL_PENDING':
+            # A previously verified but unfinished application is resumable from the
+            # registration page. Do not force the applicant through Member Login just
+            # because the email already exists; only fully approved memberships are
+            # treated as established member accounts here.
+            resumable_statuses={'EMAIL_PENDING','PENDING_PAYMENT','PAYMENT_FAILED','PAYMENT_PENDING','RENEWAL_PENDING','PENDING_REVIEW'}
+            if status in resumable_statuses:
                 resume_token=existing.get('resumeToken')
                 if not resume_token:
                     resume_token=secrets.token_urlsafe(32)
                     db.members.update_one({'_id':existing['_id']},{'$set':{'resumeToken':resume_token,'updatedAt':now()}})
                 if not existing.get('recreateToken'):
                     existing['recreateToken']=secrets.token_urlsafe(32); db.members.update_one({'_id':existing['_id']},{'$set':{'recreateToken':existing['recreateToken'],'updatedAt':now()}})
-                return jsonify(ok=False,resume=True,memberId=existing.get('id'),resumeToken=resume_token,status=status,error={'code':'REGISTRATION_IN_PROGRESS','message':'A registration for this email has already started. Use Continue where you left off.'}),409
-            return json_error('A membership account already exists for this email. Please use Member Login.',409,'MEMBER_EXISTS')
+                msg = ('Your email is already verified. Continue to your membership plan and payment.'
+                       if existing.get('emailVerified') else
+                       'A registration for this email has already started. Continue where you left off to verify your email.')
+                return jsonify(ok=False,resume=True,memberId=existing.get('id'),resumeToken=resume_token,status=status,emailVerified=bool(existing.get('emailVerified')),error={'code':'REGISTRATION_IN_PROGRESS','message':msg}),409
+            return json_error('An approved membership already exists for this email. Please use Member Login.',409,'MEMBER_EXISTS')
         member={'id':make_id('MEM'),'resumeToken':secrets.token_urlsafe(32),'recreateToken':secrets.token_urlsafe(32),'membershipNumber':'PENDING-'+secrets.token_hex(4).upper(),'name':name,'email':email,'phone':phone,'profileSlug':_slugify(name)+'-'+secrets.token_hex(3),'status':'EMAIL_PENDING','emailVerified':False,'createdAt':now(),'updatedAt':now(),'bio':str(b.get('bio','')).strip(),'profession':str(b.get('profession','')).strip(),'company':str(b.get('company','')).strip(),'location':str(b.get('location','')).strip(),'locationLat':float(b['locationLat']) if str(b.get('locationLat','')).strip() else None,'locationLng':float(b['locationLng']) if str(b.get('locationLng','')).strip() else None,'portfolioUrl':str(b.get('portfolioUrl','')).strip()}
         try:
             db.members.insert_one(member)
