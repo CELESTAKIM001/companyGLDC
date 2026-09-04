@@ -1731,6 +1731,11 @@ def member_dashboard():
     if not _member_session(): return redirect('/member/login')
     return render_template('member_dashboard.html',title='Member Portal')
 
+@app.route('/member/renew')
+def member_renew_page():
+    if not _member_session(): return redirect('/member/login?next=/member/renew')
+    return render_template('member_renew.html',title='Renew Membership')
+
 @app.route('/member/profile')
 def member_profile_dashboard():
     if not _member_session(): return redirect('/member/login?next=/member/profile')
