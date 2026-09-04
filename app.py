@@ -1530,6 +1530,16 @@ def member_dashboard():
     if not _member_session(): return redirect('/member/login')
     return render_template('member_dashboard.html',title='Member Portal')
 
+@app.route('/member/profile')
+def member_profile_dashboard():
+    if not _member_session(): return redirect('/member/login?next=/member/profile')
+    return redirect('/member/dashboard#profile')
+
+@app.route('/member/portal')
+def member_portal_page():
+    if not _member_session(): return redirect('/member/login?next=/member/portal')
+    return redirect('/member/dashboard')
+
 @app.get('/api/member/portal')
 def member_portal_api():
     m=_member_doc()

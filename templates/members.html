@@ -1,14 +1,27 @@
 {% extends 'base.html' %}
 {% block content %}
+<section class="md-hero"><div class="container">
+  <span class="md-kicker">GLDC PROFESSIONAL COMMUNITY</span>
+  <h1>Meet the people behind the work.</h1>
+  <p>Explore approved GLDC members, professionals and organisations. Discover expertise, connect with peers and view verified member profiles.</p>
+  <div class="md-search"><span>⌕</span><input id="memberSearch" placeholder="Search by name, profession, company or location…"><span id="memberCount"></span></div>
+</div></section>
 <section class="section"><div class="container">
-<span class="eyebrow">GLDC MEMBER DIRECTORY</span><h1>Meet our members</h1><p class="mutedx" style="max-width:760px">Explore approved GLDC members and their professional profiles. Only active, approved members are published in the directory.</p>
-<div id="membersGrid" class="grid grid-3" style="margin-top:28px"></div>
+  <div class="md-toolbar"><div><b>MEMBER DIRECTORY</b><span id="memberSub"> Approved members</span></div><a class="btn secondary" href="/member/login">MEMBER PORTAL</a></div>
+  <div id="membersGrid" class="md-grid"></div>
 </div></section>
 {% endblock %}
 {% block scripts %}
-<style>.member-directory-card{background:#fff;border:1px solid #e8dfd5;border-radius:18px;padding:22px}.member-avatar{width:72px;height:72px;border-radius:50%;object-fit:cover;background:#f1ece6;display:grid;place-items:center;font-weight:800;color:#8b4a18;font-size:25px;margin-bottom:15px}.member-directory-card h2{margin:0 0 6px}.member-directory-card .mutedx{min-height:42px}.member-directory-card .btn{margin-top:12px}</style>
+<style>
+.md-hero{background:linear-gradient(135deg,#211914,#633316);color:#fff;padding:76px 0 88px}.md-hero h1{font-size:clamp(2.8rem,6vw,5rem);max-width:850px;margin:10px 0 18px;letter-spacing:-.045em}.md-hero p{color:#e9ddd3;max-width:730px;font-size:1.08rem}.md-kicker{font-size:11px;font-weight:900;letter-spacing:.15em;color:#fdbf24}.md-search{max-width:780px;background:#fff;border-radius:13px;padding:7px 13px;display:flex;align-items:center;gap:10px;margin-top:28px;color:#8b4a18;box-shadow:0 18px 50px #0003}.md-search input{border:0;outline:0;flex:1;padding:12px;font-size:14px}.md-search #memberCount{font-size:10px;font-weight:900;color:#877d74}.md-toolbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px}.md-toolbar b{font-size:11px;letter-spacing:.1em}.md-toolbar span{color:#8b8179;font-size:11px}.md-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}.md-card{background:#fff;border:1px solid #e9e1d8;border-radius:18px;overflow:hidden;transition:.2s;position:relative}.md-card:hover{transform:translateY(-5px);box-shadow:0 20px 50px #34251a14}.md-cover{height:76px;background:linear-gradient(120deg,#8b4a18,#f58220);position:relative}.md-avatar{position:absolute;left:22px;bottom:-31px;width:72px;height:72px;border-radius:20px;background:#f5eee6;border:5px solid #fff;object-fit:cover;display:grid;place-items:center;color:#8b4a18;font:900 25px Montserrat}.md-body{padding:43px 22px 22px}.md-body h2{font-size:19px;margin:0 0 5px}.md-role{font-size:12px;font-weight:800;color:#8b4a18}.md-meta{font-size:11px;color:#77706a;min-height:38px;margin:9px 0 16px}.md-foot{display:flex;justify-content:space-between;align-items:center;border-top:1px solid #eee7df;padding-top:14px}.md-status{font-size:9px;font-weight:900;color:#187445;background:#e8f6ee;border-radius:99px;padding:5px 8px}.md-empty{grid-column:1/-1;padding:55px;text-align:center;background:#faf7f3;border-radius:16px;color:#766e67}
+@media(max-width:900px){.md-grid{grid-template-columns:repeat(2,1fr)}}@media(max-width:600px){.md-grid{grid-template-columns:1fr}.md-toolbar{display:block}.md-toolbar .btn{margin-top:12px}.md-hero{padding:55px 0 65px}}
+</style>
 <script>
-function esc(v){return String(v??'').replace(/[&<>"']/g,x=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[x]))}
-async function loadMembers(){const el=document.getElementById('membersGrid');try{const r=await fetch('/api/members');const j=await r.json();const ms=j.members||[];el.innerHTML=ms.length?ms.map(m=>{const initials=(m.name||'GL').split(/\s+/).slice(0,2).map(x=>x[0]).join('').toUpperCase();const img=m.photoDriveId?`<img class="member-avatar" src="/api/members/photo/${encodeURIComponent(m.id)}" alt="${esc(m.name)}">`:`<div class="member-avatar">${esc(initials)}</div>`;return `<article class="member-directory-card">${img}<h2>${esc(m.name)}</h2><p><b>${esc(m.profession||'GLDC Member')}</b></p><p class="mutedx">${esc(m.company||'')} ${m.location?'· '+esc(m.location):''}</p><a class="btn primary" href="/members/${encodeURIComponent(m.profileSlug)}">VIEW PROFILE</a></article>`}).join(''):'<div class="notice">No approved members are currently published.</div>'}catch(e){el.innerHTML='<div class="notice">We could not load the member directory right now. Please try again.</div>'}}
-loadMembers();
-</script>{% endblock %}
+const esc=v=>String(v??'').replace(/[&<>"']/g,x=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[x]));
+let allMembers=[];
+function initials(n){return (String(n||'GL').split(/\s+/).slice(0,2).map(x=>x[0]).join('')||'GL').toUpperCase()}
+function draw(ms){const q=(document.getElementById('memberSearch').value||'').toLowerCase();const list=allMembers.filter(m=>[m.name,m.profession,m.company,m.location].join(' ').toLowerCase().includes(q));document.getElementById('memberCount').textContent=list.length+' MEMBERS';document.getElementById('membersGrid').innerHTML=list.length?list.map(m=>`<article class="md-card"><div class="md-cover"></div>${m.photoDriveId?`<img class="md-avatar" src="/api/members/photo/${encodeURIComponent(m.id)}" alt="${esc(m.name)}">`:`<div class="md-avatar">${initials(m.name)}</div>`}<div class="md-body"><h2>${esc(m.name)}</h2><div class="md-role">${esc(m.profession||'GLDC Member')}</div><div class="md-meta">${esc(m.company||'Independent professional')}${m.location?' · '+esc(m.location):''}</div><div class="md-foot"><span class="md-status">APPROVED MEMBER</span><a class="link" href="/members/${encodeURIComponent(m.profileSlug)}">VIEW PROFILE →</a></div></div></article>`).join(''):'<div class="md-empty"><h3>No members found</h3><p>Try a different name, profession or location.</p></div>'}
+async function loadMembers(){try{const r=await fetch('/api/members');const j=await r.json();allMembers=j.members||[];draw(allMembers)}catch(e){document.getElementById('membersGrid').innerHTML='<div class="md-empty">The member directory is temporarily unavailable.</div>'}}
+document.getElementById('memberSearch').addEventListener('input',draw);loadMembers();
+</script>
+{% endblock %}
