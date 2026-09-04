@@ -1948,14 +1948,67 @@ def membership_verify_v14():
     session['user']={'id':str(m['_id']),'memberId':m['id'],'email':email,'name':m.get('name',''),'role':'MEMBER'}
     audit('MEMBERSHIP_EMAIL_VERIFIED','member',m['id']); return jsonify(ok=True,user=session['user'],status='PENDING_PAYMENT')
 
+@app.post('/api/membership/profile-photo')
+@login_required
+def membership_profile_photo_upload():
+    """Upload a member profile picture to the configured Google Drive folder.
+    Validation is based on both filename and actual image signatures so PNG uploads
+    are accepted even when the browser sends an unexpected MIME type.
+    """
+    m=_member_doc()
+    if not m: return json_error('Member account not found.',404,'MEMBER_NOT_FOUND')
+    f=request.files.get('file')
+    if not f or not f.filename: return json_error('Choose a profile picture.',422,'FILE_REQUIRED')
+    filename=os.path.basename(str(f.filename)).strip()
+    ext=filename.rsplit('.',1)[-1].lower() if '.' in filename else ''
+    data=f.read()
+    if not data: return json_error('The selected image is empty.',422,'EMPTY_FILE')
+    if len(data)>2*1024*1024: return json_error('Profile picture must be 2 MB or smaller.',413,'PAYLOAD_TOO_LARGE')
+    if data.startswith(b'\x89PNG\r\n\x1a\n'):
+        detected_ext, mime='png','image/png'
+    elif data.startswith(b'\xff\xd8\xff'):
+        detected_ext, mime='jpg','image/jpeg'
+    elif len(data)>=12 and data[:4]==b'RIFF' and data[8:12]==b'WEBP':
+        detected_ext, mime='webp','image/webp'
+    else:
+        return json_error('Profile picture must be a valid PNG, JPG or WEBP image.',422,'INVALID_IMAGE')
+    if ext not in {'png','jpg','jpeg','webp'}:
+        ext=detected_ext
+    if ext in {'jpg','jpeg'} and detected_ext!='jpg':
+        return json_error('The selected image file does not match its JPG extension.',422,'IMAGE_TYPE_MISMATCH')
+    safe_name=f"{m['id']}-PROFILE-PHOTO-{secrets.token_hex(4)}.{detected_ext}"
+    try:
+        drive=drive_upload_bytes(safe_name,data,mime)
+    except Exception as e:
+        app.logger.exception('Member profile photo Drive upload failed')
+        msg=str(e)
+        if 'GOOGLE_DRIVE_FOLDER_ACCESS_DENIED' in msg:
+            return json_error('Your profile picture could not be stored because the configured Google Drive folder is not writable. Share that folder with the GLDC Google service account as Editor/Content manager.',503,'DRIVE_UPLOAD_FAILED')
+        return json_error('Your profile picture could not be stored securely right now. Please try again.',503,'DRIVE_UPLOAD_FAILED')
+    rec={'id':make_id('MDOC'),'memberId':m['id'],'category':'PROFILE PHOTO','name':filename,'driveFileId':drive.get('id'),'mimeType':mime,'size':len(data),'createdAt':now(),'createdBy':m['email']}
+    db.member_documents.insert_one(rec)
+    db.members.update_one({'_id':m['_id']},{'$set':{'photoDriveId':drive.get('id'),'photoName':filename,'photoMimeType':mime,'updatedAt':now()}})
+    audit('MEMBER_PROFILE_PHOTO_UPDATED','member',m['id'],{'driveFileId':drive.get('id'),'mimeType':mime})
+    return jsonify(ok=True,photo={'driveFileId':drive.get('id'),'mimeType':mime,'name':filename})
+
 @app.post('/api/membership/profile')
 @login_required
 def membership_profile_update():
     m=_member_doc()
     if not m: return json_error('Member account not found.',404,'MEMBER_NOT_FOUND')
-    b=request.get_json(silent=True) or {}; allowed=['name','phone','bio','profession','company','location','locationLat','locationLng','portfolioUrl']
-    update={k:str(b[k]).strip() for k in allowed if k in b}; update['updatedAt']=now(); update['profileSlug']=_slugify(update.get('name',m.get('name','')))+'-'+str(m.get('id',''))[-6:].lower()
-    db.members.update_one({'_id':m['_id']},{'$set':update}); audit('MEMBER_PROFILE_UPDATED','member',m['id']); return jsonify(ok=True,member=_member_public({**m,**update}))
+    b=request.get_json(silent=True) or {}; allowed=['name','phone','bio','profession','company','location','portfolioUrl']
+    update={k:str(b[k]).strip() for k in allowed if k in b}
+    lat_raw=str(b.get('locationLat','')).strip(); lng_raw=str(b.get('locationLng','')).strip()
+    if bool(lat_raw) != bool(lng_raw): return json_error('Select a complete map location: both latitude and longitude are required.',422,'LOCATION_INCOMPLETE')
+    if lat_raw and lng_raw:
+        try: lat=float(lat_raw); lng=float(lng_raw)
+        except Exception: return json_error('The selected map location is invalid. Click the map again and try.',422,'LOCATION_INVALID')
+        if not (-90<=lat<=90 and -180<=lng<=180): return json_error('The selected map location is outside the valid coordinate range.',422,'LOCATION_INVALID')
+        update.update({'locationLat':lat,'locationLng':lng})
+    else:
+        update.update({'locationLat':None,'locationLng':None})
+    update['updatedAt']=now(); update['profileSlug']=_slugify(update.get('name',m.get('name','')))+'-'+str(m.get('id',''))[-6:].lower()
+    db.members.update_one({'_id':m['_id']},{'$set':update}); audit('MEMBER_PROFILE_UPDATED','member',m['id'],{'location':update.get('location'),'locationLat':update.get('locationLat'),'locationLng':update.get('locationLng')}); return jsonify(ok=True,member=_member_public({**m,**update}))
 
 @app.post('/api/membership/documents')
 @login_required
@@ -1990,10 +2043,17 @@ def membership_me():
 
 @app.get('/api/members/photo/<member_id>')
 def member_photo(member_id):
-    m=db.members.find_one({'id':member_id,'status':'ACTIVE'}) if db is not None else None
+    m=db.members.find_one({'id':member_id}) if db is not None else None
     if not m or not m.get('photoDriveId'): return Response('Not found',404)
+    u=_member_session()
+    is_public=str(m.get('status','')).upper() in PUBLIC_MEMBER_STATUSES
+    is_owner=bool(u and u.get('memberId')==m.get('id'))
+    if not is_public and not is_owner: return Response('Not found',404)
     try:
-        data=drive_download_bytes_by_id(m['photoDriveId']); meta=drive_metadata(m['photoDriveId'])[2]; return Response(data,mimetype=meta.get('mimeType','image/jpeg'),headers={'Cache-Control':'public, max-age=3600'})
+        data=drive_download_bytes_by_id(m['photoDriveId']); meta=drive_metadata(m['photoDriveId'])[2]
+        mime=str(m.get('photoMimeType') or meta.get('mimeType') or 'image/jpeg')
+        if mime not in {'image/png','image/jpeg','image/webp'}: mime='image/jpeg'
+        return Response(data,mimetype=mime,headers={'Cache-Control':'private, max-age=3600' if is_owner and not is_public else 'public, max-age=3600'})
     except Exception: return Response('Not found',404)
 
 @app.post('/api/membership/change-plan')
@@ -2030,6 +2090,51 @@ def membership_change_plan():
         db.payments.update_one({'id':pid},{'$set':{'status':'FAILED','error':str(e),'updatedAt':now()}})
         db.membership_renewals.update_one({'id':renewal_id},{'$set':{'status':'PAYMENT_FAILED','updatedAt':now()}})
         return json_error('We could not start the plan-change payment. Your current membership has not been changed.',502,'PLAN_CHANGE_FAILED')
+
+@app.post('/api/membership/payments/<payment_id>/retry')
+@login_required
+def membership_payment_retry(payment_id):
+    m=_member_doc()
+    if not m: return json_error('Member account not found.',404,'MEMBER_NOT_FOUND')
+    p=db.payments.find_one({'id':payment_id,'memberId':m['id']})
+    if not p: return json_error('Payment not found.',404,'PAYMENT_NOT_FOUND')
+    previous=str(p.get('status','')).upper()
+    if previous not in {'FAILED','CANCELLED'}: return json_error('This payment is not failed or cancelled, so it cannot be retried.',409,'PAYMENT_NOT_RETRYABLE')
+    plan=_membership_plan(str(p.get('planId','')))
+    if not plan: return json_error('The membership plan for this payment is no longer available.',404,'PLAN_NOT_FOUND')
+    purpose=str(p.get('purpose','MEMBERSHIP_INITIAL')).upper()
+    if purpose not in {'MEMBERSHIP_INITIAL','MEMBERSHIP_RENEWAL','MEMBERSHIP_UPGRADE'}:
+        purpose='MEMBERSHIP_INITIAL'
+    if purpose=='MEMBERSHIP_UPGRADE' and str(m.get('membershipPlanId',''))==str(plan.get('id','')):
+        return json_error('You are already on this membership plan.',409,'PLAN_UNCHANGED')
+    m=sync_membership_state(m); state=membership_state(m)
+    is_renewal=purpose in {'MEMBERSHIP_RENEWAL','MEMBERSHIP_UPGRADE'}
+    if purpose=='MEMBERSHIP_RENEWAL' and state=='ACTIVE':
+        until=m.get('validUntil'); days=(until.date()-now().date()).days if until else 9999
+        if days>renewal_window_days(): return json_error(f'Renewal opens {renewal_window_days()} days before expiry.',409,'RENEWAL_NOT_OPEN')
+    amount=float(plan.get('price',0) or 0); pid=make_id('PAY'); receipt='GLDC-RCP-'+secrets.token_hex(5).upper(); renewal_id=make_id('REN') if is_renewal else None
+    pay={'id':pid,'memberId':m['id'],'email':m['email'],'phone':m['phone'],'amount':amount,'currency':plan.get('currency','KES'),'planId':plan['id'],'planName':plan['name'],'method':'M-PESA','status':'PENDING','receiptCode':receipt,'purpose':purpose,'renewalId':renewal_id,'createdAt':now(),'updatedAt':now(),'source':'MEMBERSHIP','retryOf':payment_id}
+    db.payments.insert_one(pay)
+    if renewal_id: db.membership_renewals.insert_one({'id':renewal_id,'memberId':m['id'],'paymentId':pid,'planId':plan['id'],'planName':plan['name'],'status':'PENDING_PAYMENT','type':'UPGRADE' if purpose=='MEMBERSHIP_UPGRADE' else 'RENEWAL','createdAt':now(),'updatedAt':now()})
+    try:
+        if amount<=0:
+            db.payments.update_one({'id':pid},{'$set':{'status':'SUCCESSFUL','verifiedAt':now(),'verificationNote':'FREE_TIER: No payment required.'}})
+            if purpose=='MEMBERSHIP_UPGRADE':
+                db.members.update_one({'_id':m['_id']},{'$set':{'status':'PENDING_REVIEW','membershipPlan':plan['name'],'membershipPlanId':plan['id'],'paymentId':pid,'updatedAt':now()}})
+            elif purpose=='MEMBERSHIP_INITIAL':
+                db.members.update_one({'_id':m['_id']},{'$set':{'status':'PENDING_REVIEW','membershipPlan':plan['name'],'membershipPlanId':plan['id'],'paymentId':pid,'updatedAt':now()}})
+            if renewal_id: db.membership_renewals.update_one({'id':renewal_id},{'$set':{'status':'PENDING_REVIEW','updatedAt':now()}})
+            return jsonify(ok=True,paymentId=pid,status='SUCCESSFUL',free=True,message='This is a free membership tier. No M-Pesa payment is required; the application is now awaiting GLDC review.')
+        r=daraja_stk(m['phone'],int(amount),m.get('membershipNumber') or m['id'],f"GLDC {plan['name']} membership {'upgrade' if purpose=='MEMBERSHIP_UPGRADE' else 'renewal' if purpose=='MEMBERSHIP_RENEWAL' else 'payment'}")
+        db.payments.update_one({'id':pid},{'$set':{'merchantRequestId':r.get('MerchantRequestID'),'checkoutRequestId':r.get('CheckoutRequestID'),'responseDescription':r.get('ResponseDescription'),'updatedAt':now()}})
+        if purpose=='MEMBERSHIP_INITIAL': db.members.update_one({'_id':m['_id']},{'$set':{'status':'PAYMENT_PENDING','membershipPlan':plan['name'],'membershipPlanId':plan['id'],'updatedAt':now()}})
+        elif purpose=='MEMBERSHIP_RENEWAL': db.members.update_one({'_id':m['_id']},{'$set':{'status':'RENEWAL_PENDING','membershipPlan':plan['name'],'membershipPlanId':plan['id'],'updatedAt':now()}})
+        if renewal_id: db.membership_renewals.update_one({'id':renewal_id},{'$set':{'status':'PAYMENT_PENDING','updatedAt':now()}})
+        return jsonify(ok=True,paymentId=pid,status='PENDING',message=r.get('CustomerMessage','Payment prompt sent. Approve it on your phone.'))
+    except Exception as e:
+        db.payments.update_one({'id':pid},{'$set':{'status':'FAILED','error':str(e),'userMessage':'Payment failed. Please recheck the details and try again.','updatedAt':now()}})
+        if renewal_id: db.membership_renewals.update_one({'id':renewal_id},{'$set':{'status':'PAYMENT_FAILED','updatedAt':now()}})
+        return json_error('We could not start the payment. Please recheck the details and try again.',502,'PAYMENT_RETRY_FAILED')
 
 @app.post('/api/membership/subscribe')
 @login_required
