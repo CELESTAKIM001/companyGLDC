@@ -1369,7 +1369,21 @@ def _member_doc():
 
 def _member_public(m):
     if not m: return None
-    return {k:clean_doc(m).get(k) for k in ['id','membershipNumber','name','profileSlug','bio','profession','company','location','phone','email','status','membershipPlan','validFrom','validUntil','photoDriveId']}
+    # Public member profiles must be view-only and must never expose private contact
+    # fields such as email/phone. Only approved public-profile information is returned.
+    return {k:clean_doc(m).get(k) for k in ['id','membershipNumber','name','profileSlug','bio','profession','company','location','status','membershipPlan','validFrom','validUntil','photoDriveId','portfolioUrl']}
+
+
+PUBLIC_MEMBER_STATUSES = {'ACTIVE','EXPIRING_SOON'}
+
+def _public_member_by_slug(slug):
+    if db is None: return None
+    m=db.members.find_one({'profileSlug':str(slug).strip()})
+    if not m: return None
+    m=sync_membership_state(m)
+    if str(m.get('status','')).upper() not in PUBLIC_MEMBER_STATUSES:
+        return None
+    return m
 
 def _send_member_email(kind, member, variables, attachments=None):
     rendered=email_template_render(kind,variables)
@@ -1755,6 +1769,25 @@ def membership_certificate_verify_api(certificate_no):
     if not c: return json_error('Certificate not found.',404,'CERTIFICATE_NOT_FOUND')
     return jsonify(ok=True,certificate=clean_doc(c))
 
+@app.post('/api/member/certificates/<certificate_no>/send-email')
+def member_send_membership_certificate(certificate_no):
+    m=_member_doc()
+    if not m: return json_error('Please sign in to your member portal.',401,'AUTH_REQUIRED')
+    c=db.membership_certificates.find_one({'certificateNumber':certificate_no,'memberId':m.get('id')})
+    if not c: return json_error('Certificate not found.',404,'CERTIFICATE_NOT_FOUND')
+    recipient=str(m.get('email') or '').strip().lower()
+    if '@' not in recipient: return json_error('Your member account has no valid email address.',422,'EMAIL_RECIPIENT_INVALID')
+    plan=_membership_plan(c.get('planId','')) or {'id':c.get('planId'),'name':c.get('planName','GLDC Membership'),'months':1}
+    try:
+        subject,text,html,pdf,verify_url=_certificate_email_payload(c,m,plan)
+        send_email(recipient,subject,text,html,[('GLDC-'+certificate_no+'.pdf',pdf,'application/pdf')])
+        db.email_deliveries.insert_one({'id':make_id('MAIL'),'type':'MEMBERSHIP_CERTIFICATE_SELF_RESEND','memberId':m.get('id'),'certificateNumber':certificate_no,'to':recipient,'subject':subject,'status':'SMTP_ACCEPTED','sentAt':now(),'verificationUrl':verify_url})
+        audit('MEMBERSHIP_CERTIFICATE_SELF_SENT','certificate',certificate_no,{'memberId':m.get('id'),'recipient':recipient})
+        return jsonify(ok=True,message='Certificate email accepted by SMTP.',recipient=recipient,verificationUrl=verify_url)
+    except Exception as exc:
+        app.logger.exception('Member certificate email failed cert=%s recipient=%s',certificate_no,recipient)
+        return json_error(str(exc),503,'CERTIFICATE_EMAIL_FAILED')
+
 @app.get('/api/member/certificates/<certificate_no>/download')
 def member_certificate_history_download(certificate_no):
     m=_member_doc(); c=db.membership_certificates.find_one({'certificateNumber':certificate_no,'memberId':m.get('id')}) if m else None
@@ -1780,14 +1813,21 @@ def members_directory():
 @app.get('/api/members')
 def public_members():
     try:
-        rows=db.members.find({'status':{'$in':['ACTIVE','EXPIRING_SOON']}},{'_id':0,'id':1,'name':1,'profileSlug':1,'profession':1,'company':1,'location':1,'photoDriveId':1}).sort('name',ASCENDING)
-        return jsonify(ok=True,members=[clean_doc(x) for x in rows])
+        rows=[]
+        for x in db.members.find({}, {'_id':0,'id':1,'name':1,'profileSlug':1,'profession':1,'company':1,'location':1,'photoDriveId':1,'status':1,'validUntil':1}).sort('name',ASCENDING).limit(500):
+            x=sync_membership_state(x)
+            if str(x.get('status','')).upper() not in PUBLIC_MEMBER_STATUSES: continue
+            rows.append(clean_doc(x))
+        return jsonify(ok=True,members=rows)
     except Exception:
         return json_error('The member directory is temporarily unavailable.',503,'MEMBER_DIRECTORY_UNAVAILABLE')
 
 @app.route('/members/<slug>')
 def member_profile(slug):
-    m=db.members.find_one({'profileSlug':slug,'status':'ACTIVE'}) if db is not None else None
+    # Public, read-only profile. A member may view another approved member without
+    # entering edit mode or having that member's credentials. Expiring-soon members
+    # remain publicly discoverable until the membership actually expires.
+    m=_public_member_by_slug(slug)
     if not m: return render_template('404.html',title='Member not found'),404
     return render_template('member_profile.html',title=m.get('name','GLDC Member'),member=_member_public(m))
 
@@ -2239,6 +2279,39 @@ def admin_members_v14():
         out.append(clean_doc(x))
     return jsonify(ok=True,members=out)
 
+def _certificate_email_payload(cert, member, plan):
+    cert_no=cert.get('certificateNumber')
+    verify_url=f"{APP_URL.rstrip('/')}/membership/certificate/{cert_no}"
+    pdf=None
+    drive_id=cert.get('driveFileId')
+    if drive_id:
+        try:
+            pdf=drive_download_bytes_by_id(drive_id)
+        except Exception:
+            app.logger.exception('Certificate Drive read failed cert=%s', cert_no)
+    if not pdf or not bytes(pdf).startswith(b'%PDF-'):
+        pdf=build_membership_certificate(member, plan, cert_no, cert.get('validFrom'), cert.get('validUntil'), cert.get('issuedAt'))
+    name=member.get('name','GLDC Member')
+    subject=f"Your GLDC Membership Certificate – {cert_no}"
+    text=(f"Dear {name},\n\nYour GLDC membership certificate {cert_no} is attached.\n"
+          f"Membership No: {cert.get('membershipNumber','')}\n"
+          f"Plan: {cert.get('planName','')}\n"
+          f"Valid: {str(cert.get('validFrom',''))[:10]} to {str(cert.get('validUntil',''))[:10]}\n\n"
+          f"Verify the certificate using the QR code on the PDF or this official GLDC verification page:\n{verify_url}\n\nGLDC")
+    html=(f'<div style="font-family:Arial;max-width:680px;margin:auto">'
+          f'<div style="padding:22px;background:#8B4A18;color:#fff"><h2 style="margin:0">GLDC Membership Certificate</h2></div>'
+          f'<div style="padding:24px"><p>Dear <b>{name}</b>,</p>'
+          f'<p>Your official GLDC membership certificate is attached to this email.</p>'
+          f'<p><b>Membership No:</b> {cert.get("membershipNumber","")}<br>'
+          f'<b>Plan:</b> {cert.get("planName","")}<br>'
+          f'<b>Valid:</b> {str(cert.get("validFrom",""))[:10]} to {str(cert.get("validUntil",""))[:10]}<br>'
+          f'<b>Certificate:</b> {cert_no}</p>'
+          f'<p><b>Certificate verification:</b> Scan the QR code printed on the certificate, or '
+          f'<a href="{verify_url}">open the official GLDC verification page</a>.</p>'
+          f'<p style="font-size:12px;color:#666">The QR code opens a GLDC database-backed verification record for this specific certificate and membership period.</p>'
+          f'</div></div>')
+    return subject,text,html,pdf,verify_url
+
 @app.post('/api/admin/members/<member_id>/decision')
 @admin_required
 def admin_member_decision(member_id):
@@ -2265,19 +2338,50 @@ def admin_member_decision(member_id):
         db.members.update_one({'_id':m['_id']},{'$set':update}); m.update(update)
         if is_renewal and old_certificate_number:
             db.membership_certificates.update_one({'certificateNumber':old_certificate_number,'memberId':m['id']},{'$set':{'status':'EXPIRED','expiredAt':issue_date,'updatedAt':issue_date}})
-        cert_doc={'id':make_id('CERT'),'certificateNumber':cert,'memberId':m['id'],'membershipNumber':number,'memberName':m.get('name',''),'planId':plan['id'],'planName':plan['name'],'validFrom':from_date,'validUntil':valid,'issuedAt':issue_date,'status':'ACTIVE','replacesCertificateNumber':old_certificate_number if is_renewal else None,'createdAt':issue_date}
+        cert_doc={'id':make_id('CERT'),'certificateNumber':cert,'memberId':m['id'],'membershipNumber':number,'memberName':m.get('name',''),'planId':plan['id'],'planName':plan['name'],'validFrom':from_date,'validUntil':valid,'issuedAt':issue_date,'status':'ACTIVE','replacesCertificateNumber':old_certificate_number if is_renewal else None,'verificationUrl':f"{APP_URL.rstrip('/')}/membership/certificate/{cert}",'createdAt':issue_date}
         pdf=build_membership_certificate(m,plan,cert,from_date,valid,issue_date)
         try:
             drive=drive_upload_bytes(f'{cert}.pdf',pdf,'application/pdf'); cert_doc['driveFileId']=drive.get('id'); db.members.update_one({'_id':m['_id']},{'$set':{'certificateDriveId':drive.get('id')}})
         except Exception: app.logger.exception('Certificate Drive archive failed')
         db.membership_certificates.insert_one(cert_doc)
         if is_renewal and m.get('paymentId'): db.membership_renewals.update_one({'paymentId':m.get('paymentId')},{'$set':{'status':'APPROVED','certificateNumber':cert,'validFrom':from_date,'validUntil':valid,'approvedAt':issue_date,'approvedBy':current_user().get('email'),'updatedAt':issue_date}})
-        _send_member_email('membership_certificate',m,{'name':m['name'],'membershipNumber':number,'plan':plan['name'],'validUntil':str(valid)[:10],'certificateNumber':cert,'subject':'Your GLDC Membership Certificate','text':f'Your GLDC membership has been approved. Certificate {cert}.','html':f'<div style="font-family:Arial;max-width:640px;margin:auto"><h2 style="color:#8B4A18">Membership Approved</h2><p>Dear {m["name"]},</p><p>Your {"renewal" if is_renewal else "membership"} has been approved.</p><p><b>Membership No:</b> {number}<br><b>Plan:</b> {plan["name"]}<br><b>Valid:</b> {str(from_date)[:10]} to {str(valid)[:10]}<br><b>Certificate:</b> {cert}</p></div>'},[('GLDC-'+cert+'.pdf',pdf,'application/pdf')])
+        
+        subject,text,html,cert_pdf,verify_url=_certificate_email_payload(cert_doc,m,plan)
+        try:
+            send_email(m['email'],subject,text,html,[('GLDC-'+cert+'.pdf',cert_pdf,'application/pdf')])
+            db.email_deliveries.insert_one({'id':make_id('MAIL'),'type':'MEMBERSHIP_CERTIFICATE','memberId':m['id'],'certificateNumber':cert,'to':m['email'],'subject':subject,'status':'SMTP_ACCEPTED','sentAt':now(),'verificationUrl':verify_url})
+        except Exception as email_exc:
+            app.logger.exception('Certificate approval email failed cert=%s member=%s',cert,m.get('id'))
+            db.email_deliveries.insert_one({'id':make_id('MAIL'),'type':'MEMBERSHIP_CERTIFICATE','memberId':m['id'],'certificateNumber':cert,'to':m.get('email',''),'subject':subject,'status':'FAILED','sentAt':now(),'error':str(email_exc),'verificationUrl':verify_url})
+            # Approval remains successful; Admin/Member can resend from the certificate workspace.
+
     else:
         status='CHANGES_REQUIRED' if decision=='REQUEST_CHANGES' else 'REJECTED'; note=str(b.get('message','Please review and update your membership details.')).strip(); db.members.update_one({'_id':m['_id']},{'$set':{'status':status,'adminMessage':note,'updatedAt':now()}})
         if m.get('paymentId') and db.payments.find_one({'id':m.get('paymentId'),'purpose':{'$in':['MEMBERSHIP_RENEWAL','MEMBERSHIP_UPGRADE']}}): db.membership_renewals.update_one({'paymentId':m.get('paymentId')},{'$set':{'status':status,'adminMessage':note,'updatedAt':now()}})
         edit_url=f'{APP_URL}/member/dashboard?edit=1'; _send_member_email('membership_changes',m,{'name':m['name'],'message':note,'editUrl':edit_url,'subject':'GLDC Membership – action required','text':f'Please review your membership details: {edit_url}','html':f'<div style="font-family:Arial;max-width:640px;margin:auto"><h2 style="color:#8B4A18">Membership details need your attention</h2><p>Dear {m["name"]},</p><p>{note}</p><p><a href="{edit_url}">EDIT MY DETAILS</a></p></div>'})
     audit('MEMBERSHIP_DECISION','member',member_id,{'decision':decision}); return jsonify(ok=True,status='ACTIVE' if decision=='APPROVE' else ('CHANGES_REQUIRED' if decision=='REQUEST_CHANGES' else 'REJECTED'))
+
+@app.post('/api/admin/membership/certificates/<certificate_no>/send')
+@admin_required
+def admin_send_membership_certificate(certificate_no):
+    b=request.get_json(silent=True) or {}
+    c=db.membership_certificates.find_one({'certificateNumber':certificate_no})
+    if not c: return json_error('Certificate not found.',404,'CERTIFICATE_NOT_FOUND')
+    m=db.members.find_one({'id':c.get('memberId')})
+    if not m: return json_error('Certificate member record not found.',404,'MEMBER_NOT_FOUND')
+    recipient=str(b.get('email') or m.get('email') or '').strip().lower()
+    if '@' not in recipient: return json_error('Enter a valid recipient email address.',422,'EMAIL_RECIPIENT_INVALID')
+    plan=_membership_plan(c.get('planId','')) or db.membership_plans.find_one({'id':c.get('planId')}) or {'id':c.get('planId'),'name':c.get('planName','GLDC Membership'),'months':1}
+    try:
+        subject,text,html,pdf,verify_url=_certificate_email_payload(c,m,plan)
+        send_email(recipient,subject,text,html,[('GLDC-'+certificate_no+'.pdf',pdf,'application/pdf')])
+        db.email_deliveries.insert_one({'id':make_id('MAIL'),'type':'MEMBERSHIP_CERTIFICATE_RESEND','memberId':m.get('id'),'certificateNumber':certificate_no,'to':recipient,'subject':subject,'status':'SMTP_ACCEPTED','sentAt':now(),'verificationUrl':verify_url,'sentBy':current_user().get('email')})
+        audit('MEMBERSHIP_CERTIFICATE_SENT','certificate',certificate_no,{'memberId':m.get('id'),'recipient':recipient})
+        return jsonify(ok=True,message='Certificate email accepted by SMTP.',recipient=recipient,certificateNumber=certificate_no,verificationUrl=verify_url)
+    except Exception as exc:
+        app.logger.exception('Certificate email failed cert=%s recipient=%s',certificate_no,recipient)
+        db.email_deliveries.insert_one({'id':make_id('MAIL'),'type':'MEMBERSHIP_CERTIFICATE_RESEND','memberId':m.get('id'),'certificateNumber':certificate_no,'to':recipient,'status':'FAILED','sentAt':now(),'error':str(exc),'sentBy':current_user().get('email')})
+        return json_error(str(exc),503,'CERTIFICATE_EMAIL_FAILED')
 
 @app.get('/api/admin/membership/recover/<receipt_code>')
 @admin_required
