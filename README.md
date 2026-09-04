@@ -112,3 +112,7 @@ Use `.env.hosted.example` as the Python-compatible template for the existing hos
 - Failed/unconfirmed M-Pesa payments can be submitted by the member using the M-Pesa transaction code, amount, phone and payment date; the payment remains pending until an administrator verifies it.
 - Verified payment is required before membership approval.
 - Unfinished applications without a successful or under-review payment can be removed through a secure restart link so the member can recreate the application.
+
+
+## V20 Security Fix
+Admin mutating requests now automatically attach the server-issued CSRF token, including membership APPROVE / REQUEST CHANGES / REJECT actions. HTTP 403 CSRF failures are shown as a graceful session-refresh message instead of a raw security error.

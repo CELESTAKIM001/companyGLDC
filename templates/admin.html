@@ -43,7 +43,24 @@
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
 const $=id=>document.getElementById(id); const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-async function api(url,opt={}){const r=await fetch(url,opt);const t=await r.text();let j={};try{j=JSON.parse(t)}catch{}if(!r.ok)throw Error(j.error?.message||t||'Request failed');return j}
+async function api(url,opt={}){
+  const options={...opt,headers:{...(opt.headers||{})}};
+  const method=String(options.method||'GET').toUpperCase();
+  if(['POST','PUT','PATCH','DELETE'].includes(method)){
+    const csrf=document.querySelector('meta[name=csrf-token]')?.content||'';
+    if(csrf) options.headers['X-CSRF-Token']=csrf;
+  }
+  options.headers['X-Request-ID']=options.headers['X-Request-ID']||crypto.randomUUID?.()||String(Date.now());
+  const r=await fetch(url,options);
+  const t=await r.text();
+  let j={};try{j=t?JSON.parse(t):{}}catch{}
+  if(!r.ok){
+    if(r.status===403 && j.error?.code==='CSRF_FAILED') throw Error('Your security session has expired. Please refresh the Admin Portal and try again.');
+    if(r.status===401) throw Error('Your admin session has expired. Please sign in again.');
+    throw Error(j.error?.message||t||('Request failed (HTTP '+r.status+')'));
+  }
+  return j;
+}
 const titles={dashboard:['Business Dashboard','Connected lifecycle from enquiry to completion.'],leads:['CRM — Leads','Capture, qualify, assign and convert.'],clients:['Clients','Central client records.'],projects:['Projects','Projects, budgets, staff, milestones and progress.'],tasks:['Tasks & Milestones','Operational delivery.'],calendar:['Calendar','Deadlines and operational dates.'],membership:['Membership','Plans, member review and certificates.'],locations:['Office Locations','Public office map points.'],quotes:['Quotations','Proposal and quotation lifecycle.'],invoices:['Invoices','Billing and auditable invoice lifecycle.'],payments:['Payments','Verified payment ledger.'],reports:['Reports','Operational and financial intelligence.'],documents:['Documents','Secure project document metadata and access.'],cms:['Website CMS','Editable public content.'],drive:['Google Drive','Secure server-side Drive access.'],media:['Hero & Media','Public imagery from Google Drive.'],emails:['Email Designer','HTML transactional email templates.'],whatsapp:['WhatsApp','Public WhatsApp contact configuration.'],notifications:['Notifications','Internal communications.'],users:['Users & Roles','Permission-controlled accounts.'],audit:['Audit Logs','Traceability for important actions.'],settings:['Brand & System','Controlled GLDC configuration.']};
 function go(id,btn){document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));$(id)?.classList.add('active');document.querySelectorAll('.side button').forEach(x=>x.classList.remove('active'));if(btn)btn.classList.add('active');if(titles[id]){$('pageTitle').textContent=titles[id][0];$('pageSub').textContent=titles[id][1]}load(id)}
 async function load(id){try{if(id==='dashboard')return loadDash();if(id==='leads')return loadLeads();if(id==='clients')return loadClients();if(id==='projects')return loadProjects();if(id==='tasks')return loadTasks();if(id==='calendar')return loadCalendar();if(id==='membership')return loadMembership();if(id==='locations')return loadLocations();if(id==='quotes')return loadQuotes();if(id==='invoices')return loadInvoices();if(id==='payments')return loadPayments();if(id==='reports')return loadReports();if(id==='documents')return loadDocuments();if(id==='cms')return loadCMS();if(id==='drive')return loadDrive();if(id==='media')return loadMedia();if(id==='emails')return loadEmails();if(id==='whatsapp')return loadWhatsApp();if(id==='notifications')return loadNotifications();if(id==='users')return loadUsers();if(id==='audit')return loadAudit();if(id==='settings')return loadSettings()}catch(e){console.error(e)}}
@@ -93,6 +110,6 @@ function initLocationMap(){if(!window.L)return;const el=$('locationPicker');if(!
 function openForm(type){$('modal').style.display='block';$('modalTitle').textContent='Create '+type;const f=$('modalForm');f.dataset.type=type;let html=forms[type].map(fieldHtml).join('');if(type==='location')html=`<div class="field full"><label>Pick office location on basemap *</label><div id="locationPicker" style="height:360px;border:1px solid #ddd;border-radius:10px;overflow:hidden"></div><div id="selectedPoint" class="mutedx" style="margin-top:7px">Click anywhere on the map to place the office marker. Drag the marker to refine it.</div></div>`+html;f.innerHTML=html+`<div class="field full"><button class="btn primary">CREATE RECORD</button></div>`;$('modalMsg').innerHTML='';if(type==='location'){locationMarker=null;initLocationMap();}}
 function closeModal(){$('modal').style.display='none'}
 $('modalForm')?.addEventListener('submit',async e=>{e.preventDefault();const t=e.currentTarget.dataset.type;const b=Object.fromEntries(new FormData(e.currentTarget));try{let url='',method='POST';if(t==='plan')url='/api/admin/membership/plans';if(t==='location')url='/api/admin/locations';if(t==='client')url='/api/admin/clients';if(t==='project')url='/api/admin/projects';if(t==='task')url='/api/admin/tasks';if(t==='quote')url='/api/admin/quotations';if(t==='invoice')url='/api/admin/invoices';if(t==='payment')url='/api/admin/payments/manual';if(t==='document')url='/api/admin/documents';if(t==='notification')url='/api/admin/notifications';if(t==='user')url='/api/admin/users';if(t==='invoice')b.send=String(b.send||'true').toLowerCase()!=='false';await api(url,{method,headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});closeModal();refreshCurrent()}catch(x){$('modalMsg').innerHTML='<div class="notice">'+esc(x.message)+'</div>'}});
-async function logout(){await fetch('/api/auth/logout',{method:'POST'});location.reload()}$('loginForm')?.addEventListener('submit',async e=>{e.preventDefault();try{await api('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:loginEmail.value,password:loginPassword.value})});location.reload()}catch(x){loginMsg.innerHTML='<div class="notice">'+esc(x.message)+'</div>'}});loadDash();
+async function logout(){try{await api('/api/auth/logout',{method:'POST'})}catch(e){}location.reload()}$('loginForm')?.addEventListener('submit',async e=>{e.preventDefault();try{await api('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:loginEmail.value,password:loginPassword.value})});location.reload()}catch(x){loginMsg.innerHTML='<div class="notice">'+esc(x.message)+'</div>'}});loadDash();
 </script>
 {% endblock %}
