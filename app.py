@@ -1,6 +1,7 @@
 import os, re, json, base64, hashlib, secrets, smtplib, time, socket
 from urllib.parse import urlsplit, urlunsplit
 from datetime import datetime, timedelta, timezone, date
+from zoneinfo import ZoneInfo
 from functools import wraps
 from email.message import EmailMessage
 from io import BytesIO
@@ -94,6 +95,28 @@ db = mongo_client[MONGO_DB] if mongo_client is not None else None
 
 
 def now(): return datetime.now(timezone.utc)
+
+def app_local_now():
+    """Current application-local time used for human-facing document dates."""
+    try:
+        return datetime.now(ZoneInfo(APP_TIMEZONE))
+    except Exception:
+        return datetime.now(timezone.utc)
+
+def document_generated_date(value=None):
+    """Return YYYY-MM-DD for the date printed on the official digital stamp."""
+    if value:
+        try:
+            if isinstance(value, datetime):
+                return value.strftime('%Y-%m-%d')
+            if isinstance(value, date):
+                return value.strftime('%Y-%m-%d')
+            text=str(value).strip()
+            if text:
+                return text[:10]
+        except Exception:
+            pass
+    return app_local_now().strftime('%Y-%m-%d')
 
 def add_calendar_months(value, months):
     if isinstance(value, datetime): base_date=value.date()
@@ -267,6 +290,63 @@ def _draw_qr(c, value, x, y, size=24*mm):
         d=Drawing(size,size,transform=[size/w,0,0,size/h,0,0]); d.add(widget); renderPDF.draw(d,c,x,y)
     except Exception: pass
 
+# Official document assets. The exact files are expected at these paths when the
+# repository is deployed. They are intentionally not referenced by public HTML.
+# If the files are temporarily absent, PDFs remain renderable and use a restrained
+# vector fallback rather than crashing the document route.
+DIGITAL_STAMP_ASSET = os.path.join(os.path.dirname(__file__), 'static', 'assets', 'image_t055yg.png')
+SIGNATURE_ASSET = os.path.join(os.path.dirname(__file__), 'static', 'assets', 'SIGN.png')
+
+def _draw_digital_stamp(c, x, y, width, height, generated_date=None):
+    """Draw the GLDC seal and overlay the system-generated date at the requested position.
+
+    The date placement mirrors the supplied 1024x1024 HTML reference:
+    left 41.5%, top 72.8%, width 30%, centered, Courier bold, blue.
+    """
+    generated_date = document_generated_date(generated_date)
+    try:
+        if os.path.isfile(DIGITAL_STAMP_ASSET):
+            c.drawImage(ImageReader(DIGITAL_STAMP_ASSET), x, y, width=width, height=height,
+                        preserveAspectRatio=True, anchor='c', mask='auto')
+            # CSS top: 72.8% means the date block begins 72.8% down from the top.
+            date_x = x + width * 0.415
+            date_w = width * 0.30
+            date_top_y = y + height * (1.0 - 0.728)
+            font_size = max(4.5, min(8.0, width * 0.045))
+            c.saveState()
+            c.setFillColorRGB(3/255, 43/255, 136/255)
+            c.setFont('Courier-Bold', font_size)
+            c.drawCentredString(date_x + date_w/2, date_top_y - font_size * 0.82, generated_date)
+            c.restoreState()
+            return True
+    except Exception:
+        app.logger.exception('Digital stamp rendering failed')
+    # Safe fallback while the repository asset is being re-uploaded.
+    c.saveState()
+    c.setStrokeColorRGB(0.12, 0.18, 0.45); c.setLineWidth(1.0)
+    c.circle(x + width/2, y + height/2, min(width, height)*0.44)
+    c.setFont('Helvetica-Bold', max(6, min(11, width*0.055))); c.setFillColorRGB(0.12,0.18,0.45)
+    c.drawCentredString(x + width/2, y + height*0.53, 'GLDC')
+    c.setFont('Helvetica', max(4, min(7, width*0.035)))
+    c.drawCentredString(x + width/2, y + height*0.43, 'OFFICIAL STAMP')
+    c.setFont('Courier-Bold', max(4.5, min(8.0, width*0.045)))
+    c.setFillColorRGB(3/255, 43/255, 136/255)
+    c.drawCentredString(x + width*0.565, y + height*(1.0-0.728) - max(4.5, min(8.0, width*0.045))*0.82, generated_date)
+    c.restoreState()
+    return False
+
+def _draw_signature(c, x, y, width, height):
+    """Draw the transparent GLDC signature asset without exposing it through a route."""
+    try:
+        if os.path.isfile(SIGNATURE_ASSET):
+            c.drawImage(ImageReader(SIGNATURE_ASSET), x, y, width=width, height=height,
+                        preserveAspectRatio=True, anchor='c', mask='auto')
+            return True
+    except Exception:
+        app.logger.exception('Signature rendering failed')
+    c.saveState(); c.setStrokeColorRGB(0,0,0); c.setLineWidth(.7); c.line(x, y + height*0.18, x+width, y + height*0.18); c.restoreState()
+    return False
+
 def build_invoice_pdf(invoice):
     """Create a clean one-page invoice with non-overlapping header, body and QR footer."""
     buf=BytesIO(); c=canvas.Canvas(buf,pagesize=A4); w,h=A4; company=_company_profile()
@@ -302,15 +382,17 @@ def build_invoice_pdf(invoice):
     c.setFont('Helvetica',9); c.drawRightString(w-20*mm,y-27*mm,f'Amount paid: KES {paid:,.2f}')
     c.setFont('Helvetica-Bold',13); c.drawRightString(w-20*mm,y-36*mm,f'BALANCE: KES {balance:,.2f}')
 
-    # Dedicated footer band. No printed website URL; the QR remains the compact verification mechanism.
-    footer_y=25*mm
-    c.setStrokeColorRGB(.82,.78,.72); c.line(20*mm,footer_y+42*mm,w-20*mm,footer_y+42*mm)
+    # Dedicated footer band. QR, signature and digital stamp each have their own zone.
+    footer_y=20*mm
+    c.setStrokeColorRGB(.82,.78,.72); c.line(20*mm,footer_y+47*mm,w-20*mm,footer_y+47*mm)
     qr_value=invoice_verification_url(invoice['invoiceNumber'])
-    _draw_qr(c,qr_value,20*mm,footer_y,27*mm)
-    c.setFont('Helvetica-Bold',8); c.drawString(51*mm,footer_y+23*mm,'SCAN TO VERIFY INVOICE')
-    c.setFont('Helvetica',7.5); c.drawString(51*mm,footer_y+17*mm,'Use the QR code to verify this invoice securely.')
-    c.drawString(51*mm,footer_y+12*mm,'No website address is printed on the invoice.')
-    c.setFont('Helvetica',7.5); c.drawRightString(w-20*mm,footer_y+7*mm,'Generated electronically • Keep this invoice for your records')
+    _draw_qr(c,qr_value,20*mm,footer_y+2*mm,25*mm)
+    c.setFont('Helvetica-Bold',7.5); c.drawString(49*mm,footer_y+23*mm,'SCAN TO VERIFY INVOICE')
+    c.setFont('Helvetica',7); c.drawString(49*mm,footer_y+17*mm,'Use the QR code to verify this invoice securely.')
+    _draw_signature(c,92*mm,footer_y+3*mm,42*mm,19*mm)
+    c.setFont('Helvetica-Bold',6.8); c.drawCentredString(113*mm,footer_y+1*mm,'AUTHORIZED SIGNATURE')
+    _draw_digital_stamp(c,w-58*mm,footer_y+1*mm,34*mm,34*mm)
+    c.setFont('Helvetica',6.8); c.drawRightString(w-20*mm,footer_y-1*mm,'Generated electronically • Keep this invoice for your records')
     c.save(); return buf.getvalue()
 
 def build_receipt_pdf(payment, membership=None):
@@ -323,11 +405,15 @@ def build_receipt_pdf(payment, membership=None):
     y=h-60*mm; rows=[('Receipt code',code),('Member',(membership or {}).get('name') or payment.get('memberName','')),('Email',(membership or {}).get('email') or payment.get('email','')),('Plan',payment.get('planName','')),('Amount',f"KES {float(payment.get('amount',0)):,.2f}"),('Method',payment.get('method','M-PESA')),('Transaction',payment.get('mpesaReceiptNumber') or payment.get('reference') or ''),('Date',str(payment.get('createdAt',''))[:19].replace('T',' ')),('Status',payment.get('status','RECORDED'))]
     for k,v in rows:
         c.setFont('Helvetica-Bold',9); c.drawString(22*mm,y,k.upper()); c.setFont('Helvetica',10); c.drawString(65*mm,y,str(v)[:90]); y-=10*mm
-    _draw_qr(c,verify_url,w-58*mm,25*mm,32*mm)
-    c.setFont('Helvetica-Bold',8); c.drawString(w-105*mm,49*mm,'SCAN TO VERIFY RECEIPT')
-    c.setFont('Helvetica',7.5); c.drawString(w-105*mm,44*mm,'The QR code opens the official GLDC')
-    c.drawString(w-105*mm,40*mm,'verification page for this receipt.')
-    c.setFont('Helvetica',8.5); c.drawString(22*mm,35*mm,'This receipt confirms that the payment record was issued by GLDC. Membership approval remains subject to GLDC review where applicable.')
+    # Dedicated footer authorization zone: signature, stamp and QR never overlap.
+    footer_y=17*mm
+    _draw_signature(c,23*mm,footer_y+2*mm,43*mm,20*mm)
+    c.setFont('Helvetica-Bold',6.8); c.drawCentredString(44.5*mm,footer_y,'AUTHORIZED SIGNATURE')
+    _draw_digital_stamp(c,82*mm,footer_y,34*mm,34*mm)
+    _draw_qr(c,verify_url,w-54*mm,footer_y+1*mm,28*mm)
+    c.setFont('Helvetica-Bold',7.2); c.drawString(w-94*mm,footer_y+25*mm,'SCAN TO VERIFY RECEIPT')
+    c.setFont('Helvetica',6.8); c.drawString(w-94*mm,footer_y+20*mm,'Official GLDC verification record.')
+    c.setFont('Helvetica',7.2); c.drawString(22*mm,10*mm,'This receipt confirms that the payment record was issued by GLDC. Membership approval remains subject to GLDC review where applicable.')
     c.save(); return buf.getvalue()
 
 def build_membership_certificate(member, plan, certificate_no, valid_from=None, valid_until=None, issue_date=None):
@@ -377,20 +463,16 @@ def build_membership_certificate(member, plan, certificate_no, valid_from=None, 
     c.drawCentredString(qr_x+qr_size/2,footer_bottom-1*mm+0*mm,'SCAN TO VERIFY')
     c.setFont('Helvetica',6.8); c.drawCentredString(qr_x+qr_size/2,footer_bottom-5*mm,'Certificate record')
 
-    # Signature column
-    sig_left=87*mm; sig_width=55*mm; sig_line_y=footer_bottom+16*mm
-    c.setStrokeColorRGB(0,0,0); c.setLineWidth(.8); c.line(sig_left,sig_line_y,sig_left+sig_width,sig_line_y)
-    c.setFont('Helvetica-Bold',8); c.drawCentredString(sig_left+sig_width/2,sig_line_y-5*mm,'AUTHORIZED SIGNATURE')
-    c.setFont('Helvetica',6.8); c.drawCentredString(sig_left+sig_width/2,sig_line_y-9*mm,'For and on behalf of GLDC')
+    # Signature column — actual transparent SIGN.png when present.
+    _draw_signature(c,87*mm,footer_bottom+6*mm,55*mm,20*mm)
+    c.setFont('Helvetica-Bold',8); c.drawCentredString(114.5*mm,footer_bottom+3*mm,'AUTHORIZED SIGNATURE')
+    c.setFont('Helvetica',6.8); c.drawCentredString(114.5*mm,footer_bottom-1*mm,'For and on behalf of GLDC')
 
-    # Stamp column — physically separate from signature and QR.
-    stamp_cx=174*mm; stamp_cy=footer_bottom+18*mm; stamp_r=11*mm
-    c.setLineWidth(1); c.circle(stamp_cx,stamp_cy,stamp_r)
-    c.setFont('Helvetica-Bold',8); c.drawCentredString(stamp_cx,stamp_cy+1*mm,'GLDC')
-    c.setFont('Helvetica',5.8); c.drawCentredString(stamp_cx,stamp_cy-3.5*mm,'OFFICIAL STAMP')
+    # Stamp column — actual transparent image_t055yg.png with system date overlay.
+    _draw_digital_stamp(c,158*mm,footer_bottom+2*mm,35*mm,35*mm)
 
     # Footer note sits below the three-column authorization area, never on top of it.
-    c.setFont('Helvetica',6.8); c.drawCentredString(w/2,18*mm,'This certificate is valid only for the membership period shown above.')
+    c.setFont('Helvetica',6.8); c.drawCentredString(w/2,17*mm,'This certificate is valid only for the membership period shown above.')
     c.save(); return buf.getvalue()
 
 def email_template_render(name, variables):
@@ -864,6 +946,17 @@ def csrf_token():
 @app.before_request
 def request_context():
     request.request_id = request.headers.get('X-Request-ID') or secrets.token_hex(12)
+
+@app.before_request
+def protect_official_raw_assets():
+    # SIGN.png and image_t055yg.png are server-side signing assets. They remain
+    # in the repository's static/assets path for the deployment contract, but
+    # direct application access is restricted to authenticated administrators.
+    protected = {'/static/assets/SIGN.png', '/static/assets/image_t055yg.png'}
+    if request.path in protected and request.method in {'GET','HEAD'}:
+        u=current_user()
+        if not u or u.get('role') not in {'SUPER ADMIN / OWNER','ADMIN'}:
+            abort(404)
 
 @app.before_request
 def security_middleware():
@@ -2897,7 +2990,11 @@ def quote_pdf(q):
     y-=35*mm; c.setFont('Helvetica-Bold',10); c.drawString(25*mm,y,'SCOPE / DESCRIPTION'); c.drawRightString(w-25*mm,y,'AMOUNT')
     c.line(25*mm,y-3*mm,w-25*mm,y-3*mm); c.setFont('Helvetica',10); c.drawString(25*mm,y-12*mm,str(q.get('description',''))[:100]); c.drawRightString(w-25*mm,y-12*mm,f"KES {float(q.get('amount',0)):,.2f}")
     c.line(25*mm,y-20*mm,w-25*mm,y-20*mm); c.setFont('Helvetica-Bold',12); c.drawRightString(w-25*mm,y-32*mm,f"TOTAL: KES {float(q.get('amount',0)):,.2f}")
-    c.setFont('Helvetica',9); c.drawString(25*mm,25*mm,'This quotation is subject to GLDC approval and the terms stated in the proposal.')
+    # Official quotation footer: signature and dated digital stamp are generated at PDF creation.
+    _draw_signature(c,32*mm,18*mm,52*mm,21*mm)
+    c.setFont('Helvetica-Bold',7); c.drawCentredString(58*mm,15*mm,'AUTHORIZED SIGNATURE')
+    _draw_digital_stamp(c,w-64*mm,13*mm,38*mm,38*mm)
+    c.setFont('Helvetica',7); c.drawString(25*mm,8*mm,'This quotation is subject to GLDC approval and the terms stated in the proposal.')
     c.save(); return buf.getvalue()
 
 def list_collection(name, limit=200): return [clean_doc(x) for x in db[name].find({}).sort('createdAt',DESCENDING).limit(limit)]
