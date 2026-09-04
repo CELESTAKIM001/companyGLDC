@@ -171,10 +171,20 @@ def bootstrap_admin():
 
 
 def send_email(to, subject, text, html=None, attachments=None):
-    host=env('SMTP_HOST'); user=env('SMTP_USER','GMAIL_USER'); password=env('SMTP_PASSWORD','GMAIL_APP_PASSWORD')
+    # SMTP delivery is deliberately strict: return only after the SMTP server has
+    # accepted the message. This prevents the admin UI from reporting success when
+    # email configuration/connection/authentication actually failed.
+    to=str(to or '').strip()
+    if not re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+', to):
+        raise RuntimeError('EMAIL_RECIPIENT_INVALID')
+    host=str(env('SMTP_HOST', default='')).strip()
+    user=str(env('SMTP_USER','GMAIL_USER', default='')).strip()
+    password=str(env('SMTP_PASSWORD','GMAIL_APP_PASSWORD', default=''))
     if not host: raise RuntimeError('SMTP_NOT_CONFIGURED')
-    msg=EmailMessage();
-    from_name=str(env('EMAIL_FROM_NAME', default='GLDC')); from_address=str(env('EMAIL_FROM_ADDRESS', default='')).strip()
+    if not user or not password: raise RuntimeError('SMTP_CREDENTIALS_MISSING')
+    msg=EmailMessage()
+    from_name=str(env('EMAIL_FROM_NAME', default='GLDC')).strip() or 'GLDC'
+    from_address=str(env('EMAIL_FROM_ADDRESS', default='')).strip()
     smtp_from=str(env('SMTP_FROM', default='')).strip()
     if not from_address and smtp_from:
         m=re.match(r'^\s*(.*?)\s*<([^<>]+)>\s*$', smtp_from)
@@ -182,21 +192,38 @@ def send_email(to, subject, text, html=None, attachments=None):
             from_name=(m.group(1).strip() or from_name); from_address=m.group(2).strip()
         else:
             from_address=smtp_from
-    if not from_address: from_address=user or ''
-    msg['From']=f'{from_name} <{from_address}>' if from_address else user; msg['To']=to; msg['Subject']=subject
-    reply_to=env('EMAIL_REPLY_TO','SMTP_REPLY_TO');
+    if not from_address: from_address=user
+    if not re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+', from_address):
+        raise RuntimeError('SMTP_FROM_INVALID')
+    msg['From']=f'{from_name} <{from_address}>'; msg['To']=to; msg['Subject']=str(subject or '')
+    reply_to=str(env('EMAIL_REPLY_TO','SMTP_REPLY_TO', default='')).strip()
     if reply_to: msg['Reply-To']=reply_to
-    msg.set_content(text)
-    if html: msg.add_alternative(html, subtype='html')
+    msg.set_content(str(text or ''))
+    if html: msg.add_alternative(str(html), subtype='html')
     for filename, data, mimetype in attachments or []:
-        maintype, subtype = mimetype.split('/', 1)
-        msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=filename)
-    port=int(env('SMTP_PORT', default='587')); secure=env_bool('SMTP_SECURE', default=False)
-    if secure:
-        with smtplib.SMTP_SSL(host,port) as s: s.login(user,password); s.send_message(msg)
-    else:
-        with smtplib.SMTP(host,port) as s:
-            s.ehlo(); s.starttls(); s.ehlo(); s.login(user,password); s.send_message(msg)
+        maintype, subtype = str(mimetype).split('/', 1)
+        msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=str(filename))
+    port=int(env('SMTP_PORT', default='587'))
+    secure=env_bool('SMTP_SECURE', default=(port == 465))
+    timeout=int(env('SMTP_TIMEOUT_SECONDS', default='25'))
+    try:
+        if secure or port == 465:
+            with smtplib.SMTP_SSL(host,port,timeout=timeout) as s:
+                s.ehlo(); s.login(user,password); s.send_message(msg)
+        else:
+            with smtplib.SMTP(host,port,timeout=timeout) as s:
+                s.ehlo()
+                s.starttls()
+                s.ehlo()
+                s.login(user,password)
+                s.send_message(msg)
+    except smtplib.SMTPAuthenticationError as e:
+        raise RuntimeError('SMTP_AUTH_FAILED') from e
+    except smtplib.SMTPConnectError as e:
+        raise RuntimeError('SMTP_CONNECTION_FAILED') from e
+    except (smtplib.SMTPException, OSError, TimeoutError) as e:
+        raise RuntimeError('SMTP_DELIVERY_FAILED') from e
+    return True
 
 
 def _company_profile():
@@ -1953,14 +1980,37 @@ def admin_membership_request_action():
         db.notifications.insert_one({'id':make_id('NOT'),'memberId':m['id'],'title':'GLDC action required','message':message,'type':'MEMBERSHIP','audience':'MEMBER','createdAt':now()})
         variables={'name':m.get('name',''),'message':message,'editUrl':edit_url,'requestedFields':field_text,'deadline':deadline or 'As soon as possible','subject':'GLDC Membership – action required','text':f'Dear {m.get("name","")},\n\n{message}\n\nRequested fields: {field_text}\nDeadline: {deadline or "As soon as possible"}\n\nUpdate your details here: {edit_url}'}
         rendered=email_template_render('membership_action_request',variables)
-        if rendered: send_email(m['email'],rendered[0],rendered[1],rendered[2])
-        else: send_email(m['email'],variables['subject'],variables['text'],f'<div style="font-family:Arial;max-width:640px;margin:auto"><h2 style="color:#8B4A18">GLDC Membership – action required</h2><p>Dear <b>{m.get("name","")}</b>,</p><p>{message}</p>{due}<p><a href="{edit_url}" style="background:#8B4A18;color:#fff;padding:12px 18px;text-decoration:none">OPEN MEMBER PORTAL</a></p></div>')
-        audit('MEMBERSHIP_ACTION_REQUESTED','member',member_id,{'fields':fields,'deadline':deadline})
-        return jsonify(ok=True,message='Member action request emailed successfully.')
+        if rendered:
+            send_email(m['email'],rendered[0],rendered[1],rendered[2])
+        else:
+            fallback_html = (
+                '<div style="font-family:Arial;max-width:640px;margin:auto">'
+                '<h2 style="color:#8B4A18">GLDC Membership – action required</h2>'
+                f'<p>Dear <b>{m.get("name", "")}</b>,</p><p>{message}</p>{due}'
+                f'<p><a href="{edit_url}" style="background:#8B4A18;color:#fff;padding:12px 18px;text-decoration:none">OPEN MEMBER PORTAL</a></p>'
+                '</div>'
+            )
+            send_email(m['email'],variables['subject'],variables['text'],fallback_html)
+        sent_at=now()
+        db.email_deliveries.insert_one({'id':make_id('MAIL'),'type':'MEMBERSHIP_ACTION_REQUEST','memberId':member_id,'to':m['email'],'subject':variables['subject'],'status':'SMTP_ACCEPTED','sentAt':sent_at})
+        audit('MEMBERSHIP_ACTION_REQUESTED','member',member_id,{'fields':fields,'deadline':deadline,'emailStatus':'SMTP_ACCEPTED','email':m['email']})
+        return jsonify(ok=True,message='Email accepted by the configured SMTP server.',emailStatus='SMTP_ACCEPTED',recipient=m['email'],sentAt=sent_at.isoformat())
     except Exception as e:
         app.logger.exception('Membership action email failed')
-        if 'SMTP' in str(e).upper(): return json_error('The member details were saved, but the email could not be sent because email delivery is not configured or available.',503,'EMAIL_SEND_FAILED')
-        return json_error('We could not send the member action request right now.',503,'MEMBER_ACTION_EMAIL_FAILED')
+        try:
+            db.email_deliveries.insert_one({'id':make_id('MAIL'),'type':'MEMBERSHIP_ACTION_REQUEST','memberId':locals().get('member_id'),'to':locals().get('m',{}).get('email'),'subject':locals().get('variables',{}).get('subject','GLDC Membership – action required'),'status':'FAILED','error':str(e),'createdAt':now()})
+        except Exception:
+            app.logger.exception('Could not record failed email delivery')
+        code=str(e).upper()
+        if code=='SMTP_NOT_CONFIGURED': msg='Email was NOT sent: SMTP_HOST is not configured.'
+        elif code=='SMTP_CREDENTIALS_MISSING': msg='Email was NOT sent: SMTP username/password is missing.'
+        elif code=='SMTP_AUTH_FAILED': msg='Email was NOT sent: SMTP authentication failed. Check the SMTP username/password or app password.'
+        elif code=='SMTP_CONNECTION_FAILED': msg='Email was NOT sent: could not connect to the SMTP server. Check SMTP host/port/firewall.'
+        elif code=='SMTP_DELIVERY_FAILED': msg='Email was NOT sent: the SMTP server rejected or could not deliver the message. Check the server logs/provider settings.'
+        elif code=='SMTP_FROM_INVALID': msg='Email was NOT sent: SMTP_FROM/EMAIL_FROM_ADDRESS is invalid.'
+        elif code=='EMAIL_RECIPIENT_INVALID': msg='Email was NOT sent: the member has an invalid email address.'
+        else: msg='We could not send the member action request right now. Check the server email logs.'
+        return json_error(msg,503,'EMAIL_SEND_FAILED')
 
 @app.post('/api/admin/membership/payments/<payment_id>/verify')
 @admin_required
@@ -2126,6 +2176,35 @@ def admin_membership_renewals(): return jsonify(ok=True,renewals=list_collection
 @app.get('/api/admin/membership/certificates')
 @admin_required
 def admin_membership_certificates(): return jsonify(ok=True,certificates=list_collection('membership_certificates',500))
+
+@app.post('/api/admin/membership/test-email/<member_id>')
+@admin_required
+def admin_membership_test_email(member_id):
+    try:
+        m=db.members.find_one({'id':member_id})
+        if not m: return json_error('Member not found.',404,'MEMBER_NOT_FOUND')
+        email=str(m.get('email','')).strip().lower()
+        if not email: return json_error('This member has no email address.',422,'EMAIL_RECIPIENT_INVALID')
+        subject='GLDC email delivery test'
+        text=f'Dear {m.get("name", "Member")},\n\nThis is a test email from the GLDC Admin Portal. If you received this message, GLDC email delivery is working for your address.\n\nGLDC'
+        html=f'<div style="font-family:Arial;max-width:640px;margin:auto"><h2 style="color:#8B4A18">GLDC email delivery test</h2><p>Dear <b>{m.get("name", "Member")}</b>,</p><p>This is a test email from the GLDC Admin Portal.</p><p><b>If you received this message, email delivery is working.</b></p></div>'
+        send_email(email,subject,text,html)
+        db.email_deliveries.insert_one({'id':make_id('MAIL'),'type':'EMAIL_TEST','memberId':member_id,'to':email,'subject':subject,'status':'SMTP_ACCEPTED','sentAt':now()})
+        audit('MEMBER_EMAIL_TEST_SENT','member',member_id,{'email':email,'status':'SMTP_ACCEPTED'})
+        return jsonify(ok=True,message='Test email accepted by the configured SMTP server.',recipient=email,emailStatus='SMTP_ACCEPTED')
+    except Exception as e:
+        app.logger.exception('Member email test failed')
+        code=str(e).upper()
+        messages={
+            'SMTP_NOT_CONFIGURED':'Email was NOT sent: SMTP_HOST is not configured.',
+            'SMTP_CREDENTIALS_MISSING':'Email was NOT sent: SMTP username/password is missing.',
+            'SMTP_AUTH_FAILED':'Email was NOT sent: SMTP authentication failed. Check the SMTP username/password or app password.',
+            'SMTP_CONNECTION_FAILED':'Email was NOT sent: could not connect to the SMTP server. Check SMTP host/port/firewall.',
+            'SMTP_DELIVERY_FAILED':'Email was NOT sent: SMTP delivery failed. Check the provider/server logs.',
+            'SMTP_FROM_INVALID':'Email was NOT sent: the configured sender address is invalid.',
+            'EMAIL_RECIPIENT_INVALID':'Email was NOT sent: the member email address is invalid.'
+        }
+        return json_error(messages.get(code,'Email was NOT sent. Check the server email logs.'),503,'EMAIL_SEND_FAILED')
 
 @app.get('/api/admin/email-templates')
 @admin_required
@@ -2585,6 +2664,7 @@ def init_database():
     db.posts.create_index([('status',ASCENDING),('publishedAt',DESCENDING)])
     db.consultations.create_index([('scheduledAt',ASCENDING),('status',ASCENDING)])
     db.membership_plans.create_index([('status',ASCENDING),('sortOrder',ASCENDING)])
+    db.email_deliveries.create_index([('sentAt',DESCENDING)])
     db.membership_certificates.create_index([('certificateNumber',ASCENDING)], unique=True)
     db.membership_certificates.create_index([('memberId',ASCENDING),('issuedAt',DESCENDING)])
     db.membership_renewals.create_index([('memberId',ASCENDING),('createdAt',DESCENDING)])
