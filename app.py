@@ -1275,6 +1275,22 @@ def api_stk():
     except Exception as e:
         db.payments.update_one({'id':pid},{'$set':{'status':'FAILED','error':'Daraja request failed','updatedAt':now()}}); return json_error(str(e),500)
 
+@app.get('/api/payments/<payment_id>/status')
+@login_required
+def api_payment_status(payment_id):
+    p=db.payments.find_one({'id':payment_id},{'_id':0})
+    if not p: return json_error('Payment not found.',404,'PAYMENT_NOT_FOUND')
+    u=current_user()
+    allowed=u.get('role') in {'ADMIN','SUPER ADMIN / OWNER'} or (p.get('memberId') and p.get('memberId')==u.get('memberId')) or (p.get('email') and str(p.get('email')).lower()==str(u.get('email')).lower())
+    if not allowed: return json_error('You are not allowed to view this payment.',403,'PAYMENT_FORBIDDEN')
+    status=str(p.get('status','PENDING')).upper()
+    if status=='SUCCESSFUL': message='Payment successful. Thank you.'
+    elif status=='CANCELLED': message='User cancelled the M-Pesa transaction. You can try again.'
+    elif status=='FAILED': message='Payment failed. Please recheck the details and try again.'
+    elif status=='PENDING_ADMIN_VERIFICATION': message='Payment details were submitted and are awaiting verification.'
+    else: message='Payment prompt is still pending. Approve it on the phone, or wait for the result.'
+    return jsonify(ok=True,payment={'id':p.get('id'),'status':status,'message':message,'resultCode':p.get('resultCode'),'resultDescription':p.get('resultDescription'),'mpesaReceiptNumber':p.get('mpesaReceiptNumber'),'receiptCode':p.get('receiptCode'),'amount':p.get('amount'),'reference':p.get('reference'),'updatedAt':p.get('updatedAt')})
+
 @app.get('/api/payments/callback')
 def api_callback_probe():
     # Public, unauthenticated probe. Daraja may validate the callback URL before
@@ -1291,18 +1307,38 @@ def api_callback():
         if not cb: return jsonify(ResultCode=0,ResultDesc='Accepted')
         items=cb.get('CallbackMetadata',{}).get('Item',[]); vals={i.get('Name'):i.get('Value') for i in items}; checkout=cb.get('CheckoutRequestID'); p=db.payments.find_one({'checkoutRequestId':checkout,'status':'PENDING'})
         if not p: return jsonify(ResultCode=0,ResultDesc='Accepted')
-        success=int(cb.get('ResultCode',1))==0; update={'status':'SUCCESSFUL' if success else 'FAILED','resultCode':cb.get('ResultCode'),'resultDescription':cb.get('ResultDesc'),'updatedAt':now()}
+        result_code=cb.get('ResultCode')
+        result_desc=str(cb.get('ResultDesc') or '').strip()
+        try: result_code_int=int(result_code)
+        except Exception: result_code_int=1
+        success=result_code_int==0
+        cancelled=(not success) and (result_code_int==1032 or 'cancel' in result_desc.lower())
+        final_status='SUCCESSFUL' if success else ('CANCELLED' if cancelled else 'FAILED')
+        update={'status':final_status,'resultCode':result_code,'resultDescription':result_desc,'updatedAt':now()}
         if success: update.update({'mpesaReceiptNumber':vals.get('MpesaReceiptNumber'),'transactionDate':vals.get('TransactionDate'),'phoneNumber':vals.get('PhoneNumber'),'amount':vals.get('Amount')})
-        db.payments.update_one({'_id':p['_id']},{'$set':update}); db.audit.insert_one({'action':'PAYMENT_SUCCESS' if success else 'PAYMENT_FAILED','entity':p['id'],'createdAt':now(),'result':cb.get('ResultDesc')})
-        if success and p.get('memberId'):
+        else: update['userMessage']='You cancelled the M-Pesa transaction.' if cancelled else 'Payment failed. Please recheck the details and try again.'
+        db.payments.update_one({'_id':p['_id']},{'$set':update}); db.audit.insert_one({'action':'PAYMENT_SUCCESS' if success else ('PAYMENT_CANCELLED' if cancelled else 'PAYMENT_FAILED'),'entity':p['id'],'createdAt':now(),'result':result_desc})
+        if p.get('memberId'):
             m=db.members.find_one({'id':p.get('memberId')}); plan=db.membership_plans.find_one({'id':p.get('planId')})
             if m:
-                db.members.update_one({'_id':m['_id']},{'$set':{'status':'PENDING_REVIEW','paymentId':p['id'],'paymentReceiptCode':p.get('receiptCode'),'updatedAt':now()}})
-                if p.get('renewalId'): db.membership_renewals.update_one({'id':p['renewalId']},{'$set':{'status':'PENDING_REVIEW','paidAt':now(),'updatedAt':now()}})
-                p.update(update)
-                try:
-                    receipt=build_receipt_pdf(p,m); _send_member_email('membership_payment_receipt',m,{'name':m.get('name',''),'plan':p.get('planName',''),'amount':p.get('amount'),'receiptCode':p.get('receiptCode'),'subject':'GLDC Membership Payment Receipt','text':f'We received your membership payment. Receipt: {p.get("receiptCode")}.','html':f'<div style="font-family:Arial;max-width:640px;margin:auto"><h2 style="color:#8B4A18">Payment received</h2><p>Dear {m.get("name","")},</p><p>Your payment for <b>{p.get("planName","")}</b> has been received and your application is now awaiting GLDC review.</p><p><b>Receipt:</b> {p.get("receiptCode")}<br><b>Amount:</b> KES {float(p.get("amount",0)):,.2f}</p><p>Your payment receipt is attached.</p></div>'},[('GLDC-Receipt-'+str(p.get('receiptCode'))+'.pdf',receipt,'application/pdf')])
-                except Exception: app.logger.exception('Membership receipt email failed')
+                if success:
+                    db.members.update_one({'_id':m['_id']},{'$set':{'status':'PENDING_REVIEW','paymentId':p['id'],'paymentReceiptCode':p.get('receiptCode'),'updatedAt':now()}})
+                    if p.get('renewalId'): db.membership_renewals.update_one({'id':p['renewalId']},{'$set':{'status':'PENDING_REVIEW','paidAt':now(),'updatedAt':now()}})
+                    p.update(update)
+                    try:
+                        receipt=build_receipt_pdf(p,m); _send_member_email('membership_payment_receipt',m,{'name':m.get('name',''),'plan':p.get('planName',''),'amount':p.get('amount'),'receiptCode':p.get('receiptCode'),'subject':'GLDC Membership Payment Receipt','text':f'We received your membership payment. Receipt: {p.get("receiptCode")}.','html':f'<div style="font-family:Arial;max-width:640px;margin:auto"><h2 style="color:#8B4A18">Payment received</h2><p>Dear {m.get("name","")},</p><p>Your payment for <b>{p.get("planName","")}</b> has been received and your application is now awaiting GLDC review.</p><p><b>Receipt:</b> {p.get("receiptCode")}<br><b>Amount:</b> KES {float(p.get("amount",0)):,.2f}</p><p>Your payment receipt is attached.</p></div>'},[('GLDC-Receipt-'+str(p.get('receiptCode'))+'.pdf',receipt,'application/pdf')])
+                    except Exception: app.logger.exception('Membership receipt email failed')
+                else:
+                    failed_member_status='PAYMENT_FAILED'
+                    db.members.update_one({'_id':m['_id']},{'$set':{'status':failed_member_status,'paymentId':p['id'],'updatedAt':now()}})
+                    if p.get('renewalId'): db.membership_renewals.update_one({'id':p['renewalId']},{'$set':{'status':failed_member_status,'updatedAt':now()}})
+        elif success and p.get('email'):
+            # Generic/admin prompts can also notify the payer and provide the official receipt.
+            p.update(update)
+            try:
+                receipt=build_receipt_pdf(p,None)
+                send_email(p['email'],f'GLDC Payment Receipt {p.get("receiptCode")}',f'Your GLDC payment was received successfully. Receipt: {p.get("receiptCode")}.',f'<p>Your GLDC payment was received successfully.</p><p><b>Amount:</b> KES {float(p.get("amount",0)):,.2f}<br><b>Reference:</b> {p.get("reference") or p.get("receiptCode")}</p><p>Receipt: <b>{p.get("receiptCode")}</b></p>',[(f'GLDC-Receipt-{p.get("receiptCode")}.pdf',receipt,'application/pdf')])
+            except Exception: app.logger.exception('Generic payment receipt email failed')
         return jsonify(ResultCode=0,ResultDesc='Accepted')
     except Exception: return jsonify(ResultCode=0,ResultDesc='Accepted')
 
@@ -2417,22 +2453,40 @@ def admin_create_membership_receipt():
 @app.post('/api/admin/membership/payments/prompt')
 @admin_required
 def admin_membership_payment_prompt():
+    """Send a Daraja STK prompt to any Kenyan mobile number.
+
+    Kept on the historical membership URL for backward compatibility, but the
+    payment is now a general GLDC payment and memberId is optional.
+    """
     try:
-        b=request.get_json(silent=True) or {}; member_id=str(b.get('memberId','')).strip(); phone=str(b.get('phone','')).strip(); plan_id=str(b.get('planId','')).strip(); amount=float(b.get('amount',0) or 0)
+        b=request.get_json(silent=True) or {}
+        member_id=str(b.get('memberId','')).strip() or None
         m=db.members.find_one({'id':member_id}) if member_id else None
-        if not m: return json_error('Select a valid member.',404,'MEMBER_NOT_FOUND')
+        if member_id and not m: return json_error('Member not found.',404,'MEMBER_NOT_FOUND')
+        phone=normalize_mpesa_phone(str(b.get('phone','')).strip() or ((m or {}).get('phone','')))
+        amount=float(b.get('amount',0) or 0)
+        if amount<=0 or amount>100000000: return json_error('Enter a positive payment amount.',422,'VALIDATION_ERROR')
+        name=str(b.get('name','')).strip() or (m or {}).get('name','') or 'Customer'
+        email=str(b.get('email','')).strip().lower() or (m or {}).get('email','') or ''
+        reference=str(b.get('reference','')).strip() or ('GLDC-'+secrets.token_hex(5).upper())
+        description=str(b.get('description','')).strip() or 'GLDC payment'
+        plan_id=str(b.get('planId','')).strip() or ((m or {}).get('membershipPlanId') or None)
         plan=_membership_plan(plan_id) if plan_id else None
-        if plan: amount=float(plan.get('price',0) or 0)
-        if amount<=0: return json_error('Select a paid tier or enter a positive amount.',422,'VALIDATION_ERROR')
-        phone=normalize_mpesa_phone(phone or m.get('phone'))
-        pid=make_id('PAY'); code='GLDC-RCP-'+secrets.token_hex(5).upper(); name=(plan or {}).get('name') or m.get('membershipPlan','Membership Payment')
-        p={'id':pid,'memberId':m['id'],'email':m.get('email',''),'phone':phone,'amount':amount,'currency':CURRENCY,'planId':(plan or {}).get('id') or m.get('membershipPlanId'),'planName':name,'method':'M-PESA','status':'PENDING','purpose':'MEMBERSHIP_ADMIN_PROMPT','receiptCode':code,'createdAt':now(),'updatedAt':now(),'source':'ADMIN_PROMPT','promptedBy':current_user().get('email')}
-        db.payments.insert_one(p); r=daraja_stk(phone,int(round(amount)),f'GLDC-{code}',f'{name} payment'); db.payments.update_one({'id':pid},{'$set':{'merchantRequestId':r.get('MerchantRequestID'),'checkoutRequestId':r.get('CheckoutRequestID'),'responseDescription':r.get('ResponseDescription'),'updatedAt':now()}})
-        audit('MEMBERSHIP_PAYMENT_PROMPTED','payment',pid,{'memberId':m['id'],'amount':amount,'phone':phone,'planId':p.get('planId')})
-        return jsonify(ok=True,paymentId=pid,receiptCode=code,status='PENDING',message=r.get('CustomerMessage','Payment prompt sent to the member.'),member=m.get('name'),phone=phone)
+        plan_name=(plan or {}).get('name','')
+        pid=make_id('PAY'); code='GLDC-RCP-'+secrets.token_hex(5).upper()
+        p={'id':pid,'memberId':member_id,'memberName':name,'email':email,'phone':phone,'amount':round(amount,2),'currency':CURRENCY,'planId':(plan or {}).get('id') or plan_id,'planName':plan_name,'method':'M-PESA','status':'PENDING','purpose':'GENERAL_PAYMENT_PROMPT','receiptCode':code,'reference':reference,'description':description,'createdAt':now(),'updatedAt':now(),'source':'ADMIN_PROMPT','promptedBy':current_user().get('email'),'verificationUrl':f'{APP_URL}/receipt/{code}'}
+        db.payments.insert_one(p)
+        try:
+            r=daraja_stk(phone,int(round(amount)),reference,description)
+        except Exception as e:
+            db.payments.update_one({'id':pid},{'$set':{'status':'FAILED','error':str(e),'userMessage':'We could not send the M-Pesa prompt. Please recheck the phone number and Daraja settings.','updatedAt':now()}})
+            raise
+        db.payments.update_one({'id':pid},{'$set':{'merchantRequestId':r.get('MerchantRequestID'),'checkoutRequestId':r.get('CheckoutRequestID'),'responseDescription':r.get('ResponseDescription'),'updatedAt':now()}})
+        audit('PAYMENT_PROMPTED','payment',pid,{'memberId':member_id,'amount':amount,'phone':phone,'reference':reference,'description':description})
+        return jsonify(ok=True,paymentId=pid,receiptCode=code,status='PENDING',message=r.get('CustomerMessage','M-Pesa prompt sent. Approve it on the phone.'),name=name,phone=phone,amount=amount,reference=reference)
     except Exception as e:
-        app.logger.exception('Admin membership prompt failed request=%s',request.request_id)
-        return json_error(str(e),500,'MEMBERSHIP_PROMPT_FAILED')
+        app.logger.exception('Admin generic payment prompt failed request=%s',request.request_id)
+        return json_error(str(e),500,'PAYMENT_PROMPT_FAILED')
 
 @app.get('/invoice/<invoice_number>')
 def invoice_verify_page(invoice_number):
