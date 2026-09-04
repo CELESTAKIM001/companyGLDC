@@ -57,6 +57,12 @@ PAYMENTS_ENABLED = env_bool('PAYMENTS_ENABLED', default=True)
 MEMBERSHIP_ENABLED = env_bool('MEMBERSHIP_ENABLED', default=True)
 EMAIL_NOTIFICATIONS_ENABLED = env_bool('EMAIL_NOTIFICATIONS_ENABLED', default=True)
 ADMIN_NOTIFICATIONS_ENABLED = env_bool('ADMIN_NOTIFICATIONS_ENABLED', default=True)
+# How long a member can sit unverified / unpaid before we treat the application as abandoned
+# and alert GLDC staff so they can follow up. Configurable per-deployment via env vars.
+MEMBERSHIP_ABANDON_EMAIL_HOURS = float(env('MEMBERSHIP_ABANDON_EMAIL_HOURS', default='24'))
+MEMBERSHIP_ABANDON_PAYMENT_HOURS = float(env('MEMBERSHIP_ABANDON_PAYMENT_HOURS', default='48'))
+MEMBERSHIP_ABANDON_RENOTIFY_HOURS = float(env('MEMBERSHIP_ABANDON_RENOTIFY_HOURS', default='72'))
+CRON_SECRET = str(env('CRON_SECRET', default=''))
 DOCUMENT_STORAGE = str(env('DOCUMENT_STORAGE', default='google_drive'))
 PDF_ENABLED = env_bool('PDF_ENABLED', default=True)
 PDF_QR_ENABLED = env_bool('PDF_QR_ENABLED', default=False)
@@ -1239,6 +1245,166 @@ def _send_member_email(kind, member, variables, attachments=None):
     else:
         subject=variables.get('subject','GLDC Membership Update'); text=variables.get('text',''); html=variables.get('html','<p>'+text+'</p>')
     send_email(member['email'],subject,text,html,attachments)
+
+def _admin_emails():
+    try:
+        return [u['email'] for u in db.users.find({'role':{'$in':['SUPER ADMIN / OWNER','ADMIN']},'status':'ACTIVE'},{'email':1}) if u.get('email')]
+    except Exception:
+        app.logger.exception('Could not load admin recipient list')
+        return []
+
+# Statuses that count as "registration in progress" for abandonment tracking, mapped to the
+# staleness threshold (hours of no activity) that marks that stage as abandoned.
+ABANDONMENT_STAGE_THRESHOLDS = {
+    'EMAIL_PENDING': MEMBERSHIP_ABANDON_EMAIL_HOURS,
+    'PENDING_PAYMENT': MEMBERSHIP_ABANDON_PAYMENT_HOURS,
+    'PAYMENT_FAILED': MEMBERSHIP_ABANDON_PAYMENT_HOURS,
+    'PAYMENT_PENDING': MEMBERSHIP_ABANDON_PAYMENT_HOURS,
+    'RENEWAL_PENDING': MEMBERSHIP_ABANDON_PAYMENT_HOURS,
+}
+ABANDONMENT_STAGE_LABELS = {
+    'EMAIL_PENDING': 'has not verified their email',
+    'PENDING_PAYMENT': 'has not completed membership payment',
+    'PAYMENT_FAILED': 'had a failed M-Pesa payment and has not retried',
+    'PAYMENT_PENDING': 'has an M-Pesa prompt outstanding',
+    'RENEWAL_PENDING': 'started a renewal but has not completed payment',
+}
+
+def _find_abandoned_members():
+    """Members stuck at a registration/payment stage past the configured threshold,
+    excluding ones already flagged within the re-notify window."""
+    if db is None: return []
+    out=[]
+    t=now()
+    for status, hours in ABANDONMENT_STAGE_THRESHOLDS.items():
+        cutoff = t - timedelta(hours=hours)
+        renotify_cutoff = t - timedelta(hours=MEMBERSHIP_ABANDON_RENOTIFY_HOURS)
+        query = {
+            'status': status,
+            'updatedAt': {'$lte': cutoff},
+            '$or': [
+                {'abandonedNotifiedAt': {'$exists': False}},
+                {'abandonedNotifiedAt': None},
+                {'abandonedNotifiedAt': {'$lte': renotify_cutoff}},
+            ],
+        }
+        for m in db.members.find(query):
+            updated = m.get('updatedAt') or m.get('createdAt') or t
+            if getattr(updated, 'tzinfo', None) is None: updated = updated.replace(tzinfo=timezone.utc)
+            hours_stalled = round((t - updated).total_seconds() / 3600, 1)
+            out.append({'member': m, 'status': status, 'hoursStalled': hours_stalled, 'reason': ABANDONMENT_STAGE_LABELS.get(status, 'has not completed registration')})
+    out.sort(key=lambda x: x['hoursStalled'], reverse=True)
+    return out
+
+def _notify_admin_member_abandoned(entry):
+    m=entry['member']; reason=entry['reason']; hours=entry['hoursStalled']
+    title='Membership application stalled'
+    message=f"{m.get('name','A prospective member')} ({m.get('email','')}) {reason}. No activity for about {int(hours)} hours."
+    try:
+        db.notifications.insert_one({'id':make_id('NOT'),'title':title,'message':message,'type':'MEMBERSHIP_ABANDONED','audience':'ADMIN','memberId':m.get('id'),'read':False,'createdAt':now()})
+    except Exception:
+        app.logger.exception('Failed to write admin abandonment notification')
+    if ADMIN_NOTIFICATIONS_ENABLED and EMAIL_NOTIFICATIONS_ENABLED:
+        recipients=_admin_emails()
+        for to in recipients:
+            try:
+                send_email(to, f'[GLDC] {title}', message, f'<p>{message}</p><p><a href="{APP_URL}{ADMIN_PATH}">Open Admin Portal</a></p>')
+            except Exception:
+                app.logger.exception('Failed to email admin about abandoned registration')
+    try:
+        db.members.update_one({'_id':m['_id']},{'$set':{'abandonedNotifiedAt':now(),'abandonedStage':entry['status']},'$inc':{'abandonedNotifyCount':1}})
+    except Exception:
+        app.logger.exception('Failed to mark member as abandonment-notified')
+
+@app.get('/api/cron/check-abandoned-registrations')
+def cron_check_abandoned_registrations():
+    """Invoked by Vercel Cron (or any scheduler) on a recurring basis. Vercel automatically
+    sends 'Authorization: Bearer <CRON_SECRET>' for configured Cron Jobs; we require that
+    secret to match so the endpoint cannot be triggered by the public internet."""
+    if not CRON_SECRET:
+        return json_error('CRON_SECRET is not configured.',503,'CRON_NOT_CONFIGURED')
+    supplied=request.headers.get('Authorization','').removeprefix('Bearer ').strip() or request.args.get('secret','').strip()
+    if not secrets.compare_digest(supplied, CRON_SECRET):
+        return json_error('Unauthorized.',401,'UNAUTHORIZED')
+    if db is None: return json_error('Database unavailable.',503,'DATABASE_UNAVAILABLE')
+    entries=_find_abandoned_members()
+    for entry in entries:
+        _notify_admin_member_abandoned(entry)
+    return jsonify(ok=True, checked=len(entries), notified=len(entries))
+
+@app.get('/api/admin/membership/abandoned')
+@admin_required
+def admin_membership_abandoned():
+    entries=_find_abandoned_members()
+    out=[{'member':clean_doc(e['member']),'status':e['status'],'hoursStalled':e['hoursStalled'],'reason':e['reason']} for e in entries]
+    return jsonify(ok=True,abandoned=out)
+
+@app.post('/api/admin/membership/abandoned/<member_id>/remind')
+@admin_required
+def admin_membership_abandoned_remind(member_id):
+    m=db.members.find_one({'id':member_id})
+    if not m: return json_error('Member not found.',404,'MEMBER_NOT_FOUND')
+    status=str(m.get('status','')).upper()
+    if status not in ABANDONMENT_STAGE_THRESHOLDS: return json_error('This member is not at a stalled registration stage.',409,'NOT_STALLED')
+    try:
+        resume_note='Verify your email to continue.' if status=='EMAIL_PENDING' else 'Complete your membership payment to continue.'
+        _send_member_email('membership_reminder',m,{'name':m.get('name',''),'message':f"GLDC noticed your membership application is incomplete. {resume_note}",'resumeUrl':f'{APP_URL}/member/dashboard','subject':'Continue your GLDC membership application','text':f"Hi {m.get('name','')}, your GLDC membership application is incomplete. {resume_note} Continue here: {APP_URL}/member/dashboard",'html':f'<div style="font-family:Arial;max-width:640px;margin:auto"><h2 style="color:#8B4A18">Continue your GLDC membership application</h2><p>Dear {m.get("name","")},</p><p>GLDC noticed your membership application is incomplete. {resume_note}</p><p><a href="{APP_URL}/member/dashboard">CONTINUE WHERE I LEFT OFF</a></p></div>'})
+        audit('MEMBERSHIP_ABANDONMENT_REMINDER_SENT','member',member_id)
+        return jsonify(ok=True,message='Reminder email sent to the member.')
+    except Exception:
+        app.logger.exception('Manual abandonment reminder failed')
+        return json_error('Could not send the reminder email right now.',502,'REMINDER_FAILED')
+
+MEMBER_ADMIN_EDITABLE_FIELDS = {'name','email','phone','profession','company','location','bio','portfolioUrl','membershipNumber','adminMessage'}
+MEMBER_ADMIN_EDITABLE_STATUSES = {'EMAIL_PENDING','PENDING_PAYMENT','PAYMENT_FAILED','PAYMENT_PENDING','PENDING_REVIEW','CHANGES_REQUIRED','REJECTED','RENEWAL_PENDING','ACTIVE','EXPIRED'}
+
+@app.patch('/api/admin/members/<member_id>')
+@admin_required
+def admin_member_update(member_id):
+    """General-purpose admin edit for a member record: contact details, membership dates
+    and (within safe limits) status. Approving a brand-new membership with a certificate
+    still goes through /decision — this endpoint will not silently activate a member that
+    has no membership number or validity dates."""
+    m=db.members.find_one({'id':member_id})
+    if not m: return json_error('Member not found.',404,'MEMBER_NOT_FOUND')
+    b=request.get_json(silent=True) or {}
+    update={}; before={}
+    for k in MEMBER_ADMIN_EDITABLE_FIELDS:
+        if k in b:
+            v=str(b[k]).strip()
+            if k=='email': v=v.lower()
+            if v!=str(m.get(k,'')): before[k]=m.get(k); update[k]=v
+    if 'email' in update:
+        if '@' not in update['email']: return json_error('Enter a valid email address.',422,'EMAIL_INVALID')
+        dup=db.members.find_one({'email':update['email'],'id':{'$ne':member_id}})
+        if dup: return json_error('Another member already uses that email address.',409,'EMAIL_IN_USE')
+        update['emailVerified']=False
+        if str(m.get('status','')).upper() in {'EMAIL_PENDING','PENDING_PAYMENT','PAYMENT_FAILED','PAYMENT_PENDING'}:
+            update['status']='EMAIL_PENDING'; update['resumeToken']=secrets.token_urlsafe(32)
+    if 'phone' in update:
+        try: update['phone']=normalize_mpesa_phone(update['phone'])
+        except RuntimeError: return json_error('Enter a valid Kenyan M-Pesa phone number.',422,'PHONE_INVALID')
+    for date_field in ('validFrom','validUntil'):
+        if date_field in b and str(b[date_field]).strip():
+            try:
+                dt=datetime.strptime(str(b[date_field]).strip()[:10],'%Y-%m-%d').replace(tzinfo=timezone.utc)
+            except ValueError:
+                return json_error(f'{date_field} must be a valid date (YYYY-MM-DD).',422,'DATE_INVALID')
+            before[date_field]=m.get(date_field); update[date_field]=dt
+    if 'status' in b and str(b['status']).strip():
+        new_status=str(b['status']).strip().upper()
+        if new_status not in MEMBER_ADMIN_EDITABLE_STATUSES: return json_error('Unsupported status value.',422,'STATUS_INVALID')
+        if new_status=='ACTIVE':
+            number=update.get('membershipNumber', m.get('membershipNumber',''))
+            valid_until=update.get('validUntil', m.get('validUntil'))
+            if not number or str(number).startswith('PENDING-') or not valid_until:
+                return json_error('A membership number and validity dates are required before marking a member ACTIVE. Use Approve Membership to issue a certificate correctly, or set those fields first.',422,'MISSING_MEMBERSHIP_DETAILS')
+        before['status']=m.get('status'); update['status']=new_status
+    if not update: return json_error('No changes were submitted.',422,'NO_CHANGES')
+    update['updatedAt']=now()
+    db.members.update_one({'_id':m['_id']},{'$set':update})
+    audit('MEMBER_ADMIN_EDITED','member',member_id,{'before':{k:(v.isoformat() if hasattr(v,'isoformat') else v) for k,v in before.items()},'after':{k:(v.isoformat() if hasattr(v,'isoformat') else v) for k,v in update.items() if k!='updatedAt'}})
+    return jsonify(ok=True,member=clean_doc({**m,**update}))
 
 @app.route('/member/login')
 def member_login_page():

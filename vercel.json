@@ -14,5 +14,11 @@
       "src": "/(.*)",
       "dest": "/api/index.py"
     }
+  ],
+  "crons": [
+    {
+      "path": "/api/cron/check-abandoned-registrations",
+      "schedule": "0 6 * * *"
+    }
   ]
 }
