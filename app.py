@@ -1083,7 +1083,9 @@ def api_stats():
 @admin_required
 def api_settings():
     s=db.settings.find_one({'key':'public'}) or {}
-    policy=db.settings.find_one({'key':'membership_policy'}) or {}; return jsonify(ok=True,settings={'currency':CURRENCY,'timezone':APP_TIMEZONE,'appUrl':APP_URL,'adminPath':ADMIN_PATH,'darajaEnvironment':str(env('DARAJA_ENV','DARAJA_ENVIRONMENT', default='production')),'smtpConfigured':bool(env('SMTP_HOST') and env('SMTP_USER','GMAIL_USER') and env('SMTP_PASSWORD','GMAIL_APP_PASSWORD') and env('SMTP_FROM','EMAIL_FROM_ADDRESS')),'googleDriveConfigured':env_bool('GOOGLE_DRIVE_ENABLED', default=True) and bool(env('GOOGLE_DRIVE_FOLDER_ID')),'googleDriveAuth':'service-account','googleSheetsConfigured':env_bool('GOOGLE_SHEETS_ENABLED', default=False) and bool(env('GOOGLE_SPREADSHEET_ID')),'mongodbConfigured':bool(MONGO_URI),'paymentsEnabled':PAYMENTS_ENABLED,'membershipEnabled':MEMBERSHIP_ENABLED,'documentStorage':DOCUMENT_STORAGE,'pdfEnabled':PDF_ENABLED,'renewalWindowDays':int(policy.get('renewalWindowDays',renewal_window_days())),'public':{k:s.get(k,'') for k in ['company','phone','email','location','hours','tagline']}})
+    policy=db.settings.find_one({'key':'membership_policy'}) or {}
+    abandon=abandonment_settings()
+    return jsonify(ok=True,settings={'currency':CURRENCY,'timezone':APP_TIMEZONE,'appUrl':APP_URL,'adminPath':ADMIN_PATH,'darajaEnvironment':str(env('DARAJA_ENV','DARAJA_ENVIRONMENT', default='production')),'smtpConfigured':bool(env('SMTP_HOST') and env('SMTP_USER','GMAIL_USER') and env('SMTP_PASSWORD','GMAIL_APP_PASSWORD') and env('SMTP_FROM','EMAIL_FROM_ADDRESS')),'googleDriveConfigured':env_bool('GOOGLE_DRIVE_ENABLED', default=True) and bool(env('GOOGLE_DRIVE_FOLDER_ID')),'googleDriveAuth':'service-account','googleSheetsConfigured':env_bool('GOOGLE_SHEETS_ENABLED', default=False) and bool(env('GOOGLE_SPREADSHEET_ID')),'mongodbConfigured':bool(MONGO_URI),'paymentsEnabled':PAYMENTS_ENABLED,'membershipEnabled':MEMBERSHIP_ENABLED,'documentStorage':DOCUMENT_STORAGE,'pdfEnabled':PDF_ENABLED,'renewalWindowDays':int(policy.get('renewalWindowDays',renewal_window_days())),'abandonEmailHours':abandon['emailHours'],'abandonPaymentHours':abandon['paymentHours'],'abandonRenotifyHours':abandon['renotifyHours'],'adminNotificationsEnabled':ADMIN_NOTIFICATIONS_ENABLED,'emailNotificationsEnabled':EMAIL_NOTIFICATIONS_ENABLED,'cronSecretConfigured':bool(CRON_SECRET),'public':{k:s.get(k,'') for k in ['company','phone','email','location','hours','tagline']}})
 
 @app.post('/api/admin/settings')
 @admin_required
@@ -1091,13 +1093,25 @@ def api_settings_save():
     b=request.get_json(force=True) or {}
     allowed={k:str(b.get(k,'')).strip()[:200] for k in ['company','phone','email','location','hours','tagline'] if k in b}
     if allowed: db.settings.update_one({'key':'public'},{'$set':{**allowed,'key':'public','updatedAt':now()}},upsert=True)
+    policy_update={}
     if 'renewalWindowDays' in b:
         try: days=int(b.get('renewalWindowDays',30) or 30)
         except Exception: return json_error('Renewal window must be a whole number of days.',422,'VALIDATION_ERROR')
         if days<0 or days>365: return json_error('Renewal window must be between 0 and 365 days.',422,'VALIDATION_ERROR')
-        db.settings.update_one({'key':'membership_policy'},{'$set':{'renewalWindowDays':days,'updatedAt':now(),'updatedBy':current_user().get('email')}},upsert=True)
-    audit('SYSTEM_SETTINGS_UPDATED','settings','public',{'renewalWindowDays':b.get('renewalWindowDays')})
-    return jsonify(ok=True,renewalWindowDays=renewal_window_days())
+        policy_update['renewalWindowDays']=days
+    abandon_fields={'abandonEmailHours':(1,720),'abandonPaymentHours':(1,720),'abandonRenotifyHours':(1,720)}
+    for key,(lo,hi) in abandon_fields.items():
+        if key in b:
+            try: hours=float(b.get(key))
+            except Exception: return json_error(f'{key} must be a number of hours.',422,'VALIDATION_ERROR')
+            if hours<lo or hours>hi: return json_error(f'{key} must be between {lo} and {hi} hours.',422,'VALIDATION_ERROR')
+            policy_update[key]=hours
+    if policy_update:
+        policy_update['updatedAt']=now(); policy_update['updatedBy']=current_user().get('email')
+        db.settings.update_one({'key':'membership_policy'},{'$set':policy_update},upsert=True)
+    audit('SYSTEM_SETTINGS_UPDATED','settings','public',{'renewalWindowDays':b.get('renewalWindowDays'),**{k:b.get(k) for k in abandon_fields if k in b}})
+    abandon=abandonment_settings()
+    return jsonify(ok=True,renewalWindowDays=renewal_window_days(),abandonEmailHours=abandon['emailHours'],abandonPaymentHours=abandon['paymentHours'],abandonRenotifyHours=abandon['renotifyHours'])
 
 @app.get('/api/admin/content')
 @admin_required
@@ -1270,15 +1284,31 @@ ABANDONMENT_STAGE_LABELS = {
     'RENEWAL_PENDING': 'started a renewal but has not completed payment',
 }
 
+def abandonment_settings():
+    policy = db.settings.find_one({'key':'membership_policy'}) or {} if db is not None else {}
+    return {
+        'emailHours': float(policy.get('abandonEmailHours', MEMBERSHIP_ABANDON_EMAIL_HOURS)),
+        'paymentHours': float(policy.get('abandonPaymentHours', MEMBERSHIP_ABANDON_PAYMENT_HOURS)),
+        'renotifyHours': float(policy.get('abandonRenotifyHours', MEMBERSHIP_ABANDON_RENOTIFY_HOURS)),
+    }
+
 def _find_abandoned_members():
     """Members stuck at a registration/payment stage past the configured threshold,
     excluding ones already flagged within the re-notify window."""
     if db is None: return []
     out=[]
     t=now()
-    for status, hours in ABANDONMENT_STAGE_THRESHOLDS.items():
+    settings=abandonment_settings()
+    stage_hours = {
+        'EMAIL_PENDING': settings['emailHours'],
+        'PENDING_PAYMENT': settings['paymentHours'],
+        'PAYMENT_FAILED': settings['paymentHours'],
+        'PAYMENT_PENDING': settings['paymentHours'],
+        'RENEWAL_PENDING': settings['paymentHours'],
+    }
+    renotify_cutoff = t - timedelta(hours=settings['renotifyHours'])
+    for status, hours in stage_hours.items():
         cutoff = t - timedelta(hours=hours)
-        renotify_cutoff = t - timedelta(hours=MEMBERSHIP_ABANDON_RENOTIFY_HOURS)
         query = {
             'status': status,
             'updatedAt': {'$lte': cutoff},
@@ -1332,12 +1362,59 @@ def cron_check_abandoned_registrations():
         _notify_admin_member_abandoned(entry)
     return jsonify(ok=True, checked=len(entries), notified=len(entries))
 
+@app.get('/api/admin/daraja/test')
+@admin_required
+def admin_daraja_test():
+    """Verifies Daraja config without moving money: confirms which required vars are
+    set, then attempts the OAuth token exchange (proves consumer key/secret + DARAJA_ENV
+    are correct together) without calling the STK push endpoint at all."""
+    groups = {
+        'DARAJA_CONSUMER_KEY': ('DARAJA_CONSUMER_KEY',),
+        'DARAJA_CONSUMER_SECRET': ('DARAJA_CONSUMER_SECRET',),
+        'DARAJA_SHORTCODE': ('DARAJA_SHORTCODE','DARAJA_PARTY_A_SHORTCODE'),
+        'DARAJA_TILL_NUMBER': ('DARAJA_TILL_NUMBER','DARAJA_PARTY_B_BUYGOODS_TILL','DARAJA_BUYGOODS_TILL'),
+        'DARAJA_PASSKEY': ('DARAJA_PASSKEY',),
+        'DARAJA_CALLBACK_URL': ('DARAJA_CALLBACK_URL',),
+    }
+    missing = [name for name, aliases in groups.items() if not any(env(k) for k in aliases)]
+    result = {
+        'darajaEnabled': env_bool('DARAJA_ENABLED', default=True),
+        'darajaEnvironment': str(env('DARAJA_ENV','DARAJA_ENVIRONMENT', default='production')),
+        'callbackUrl': str(env('DARAJA_CALLBACK_URL', default=APP_URL + '/api/payments/callback')),
+        'missingConfig': missing,
+        'oauth': None,
+    }
+    if missing:
+        result['oauth'] = 'SKIPPED_MISSING_CONFIG'
+        return jsonify(ok=False, daraja=result, error={'code':'DARAJA_CONFIG_MISSING','message':'Cannot test the OAuth handshake until these are set in Vercel: '+', '.join(missing)+'.'}), 422
+    try:
+        base, token = daraja_token()
+        result['oauth'] = 'SUCCESS'
+        result['apiBase'] = base
+        return jsonify(ok=True, daraja=result, message='Daraja OAuth succeeded — consumer key/secret and DARAJA_ENV are correctly matched. STK pushes should work; if a real payment still fails, check the specific payment record for the exact Daraja error.')
+    except RuntimeError as e:
+        code, _, detail = str(e).partition(':')
+        result['oauth'] = 'FAILED'
+        result['oauthError'] = detail or code
+        return jsonify(ok=False, daraja=result, error={'code':'DARAJA_OAUTH_FAILED','message':f'Daraja OAuth failed: {detail or code}. Check DARAJA_CONSUMER_KEY/SECRET and that DARAJA_ENV ({result["darajaEnvironment"]}) matches where those credentials were issued.'}), 502
+
 @app.get('/api/admin/membership/abandoned')
 @admin_required
 def admin_membership_abandoned():
     entries=_find_abandoned_members()
     out=[{'member':clean_doc(e['member']),'status':e['status'],'hoursStalled':e['hoursStalled'],'reason':e['reason']} for e in entries]
     return jsonify(ok=True,abandoned=out)
+
+@app.post('/api/admin/membership/abandoned/run-check')
+@admin_required
+def admin_membership_abandoned_run_check():
+    """Lets an admin trigger the same check the cron job runs, on demand, so the
+    feature can be tested/verified without waiting for the schedule or touching CRON_SECRET."""
+    entries=_find_abandoned_members()
+    for entry in entries:
+        _notify_admin_member_abandoned(entry)
+    audit('MEMBERSHIP_ABANDONMENT_CHECK_RUN_MANUALLY','settings','abandoned',{'flagged':len(entries)})
+    return jsonify(ok=True,checked=len(entries),notified=len(entries))
 
 @app.post('/api/admin/membership/abandoned/<member_id>/remind')
 @admin_required
@@ -2339,7 +2416,7 @@ def init_database():
       'membership_certificate':{'subject':'Your GLDC Membership Certificate – {{certificateNumber}}','text':'Congratulations {{name}}. Your GLDC membership certificate is attached.','html':'<div style=\"font-family:Arial;max-width:640px;margin:auto\"><div style=\"padding:24px;background:#8B4A18;color:#fff\"><h2>Membership Approved</h2></div><div style=\"padding:24px\"><p>Dear <b>{{name}}</b>,</p><p>Your GLDC membership has been approved. Your certificate is attached.</p><p><b>Plan:</b> {{plan}}<br><b>Membership No:</b> {{membershipNumber}}<br><b>Valid until:</b> {{validUntil}}</p></div></div>'}
     }
     for name,t in email_defaults.items(): db.email_templates.update_one({'name':name},{'$setOnInsert':{'name':name,'createdAt':now()},'$set':t},upsert=True)
-    db.settings.update_one({'key':'membership_policy'},{'$setOnInsert':{'key':'membership_policy','renewalWindowDays':30,'createdAt':now()}},upsert=True)
+    db.settings.update_one({'key':'membership_policy'},{'$setOnInsert':{'key':'membership_policy','renewalWindowDays':30,'abandonEmailHours':MEMBERSHIP_ABANDON_EMAIL_HOURS,'abandonPaymentHours':MEMBERSHIP_ABANDON_PAYMENT_HOURS,'abandonRenotifyHours':MEMBERSHIP_ABANDON_RENOTIFY_HOURS,'createdAt':now()}},upsert=True)
     defaults={'home.heroTitle':'Land. Design. Development. Done Right.','home.heroText':'Professional land, planning, design and development consultancy for clients who need practical outcomes.','home.primaryCta':'REQUEST A QUOTE','home.secondaryCta':'VIEW PROJECTS','site.company':'Gavin Land & Design Consultants','site.tagline':'Land • Design • Development • Consultancy','site.phone':'+254','site.email':'info@yourdomain.co.ke','site.location':'Kenya'}
     for key,value in defaults.items(): db.content.update_one({'key':key},{'$setOnInsert':{'key':key,'value':value,'public':True,'createdAt':now()}},upsert=True)
     db.tasks.create_index([('projectId',ASCENDING),('status',ASCENDING)])

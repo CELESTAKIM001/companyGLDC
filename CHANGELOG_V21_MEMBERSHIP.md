@@ -50,6 +50,28 @@ pass adds the two pieces that were missing.
   (`#memberEditModal`) with all the fields above; also reachable from the
   Stalled applications list.
 
+## 3. Thresholds made admin-tunable at runtime (no redeploy)
+
+Mirrors the existing `renewalWindowDays` pattern (`db.settings` key
+`membership_policy`) instead of leaving the new thresholds env-only:
+
+- Admin panel → Settings → "Abandoned application alerts" now has 3 fields:
+  hours before email-unverified alert, hours before payment-incomplete
+  alert, hours before re-alerting. Saved via `POST /api/admin/settings`
+  (validated 1–720h each), read back via `GET /api/admin/settings`.
+- `_find_abandoned_members()` reads these from `db.settings` first, falling
+  back to the `MEMBERSHIP_ABANDON_*_HOURS` env vars only if nothing has been
+  saved yet — so env vars still work as sane defaults on a fresh deploy, but
+  staff can retune without touching Vercel.
+- `CRON_SECRET` stays env-only (rendering a secret into an editable web form
+  would defeat its purpose) — but the Settings page now shows a plain
+  "CONFIGURED / NOT SET" status line for it, plus whether admin email alerts
+  are enabled, so staff can self-diagnose without opening the Vercel dashboard.
+- New `POST /api/admin/membership/abandoned/run-check` lets an admin trigger
+  the exact same check the cron job runs, on demand — a "RUN CHECK NOW"
+  button next to "Stalled applications" — so the whole feature can be tested
+  immediately after deploy instead of waiting for the daily cron.
+
 ## Not touched
 
 - The registration/OTP/payment flow itself — already solid, left as-is.
