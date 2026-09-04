@@ -6,6 +6,10 @@ from io import BytesIO
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.pdfgen import canvas
+from reportlab.graphics.barcode import qr
+from reportlab.graphics.shapes import Drawing
+from reportlab.graphics import renderPDF
+from reportlab.lib.utils import ImageReader
 
 import requests
 import bcrypt
@@ -150,32 +154,101 @@ def send_email(to, subject, text, html=None, attachments=None):
             s.ehlo(); s.starttls(); s.ehlo(); s.login(user,password); s.send_message(msg)
 
 
+def _company_profile():
+    vals={}
+    if db is not None:
+        try:
+            vals={x.get('key'):x.get('value') for x in db.content.find({'key':{'$regex':r'^site\.'}})}
+        except Exception: pass
+    return {
+        'name': vals.get('site.company') or os.getenv('COMPANY_NAME','Gavin Land & Design Consultants'),
+        'tagline': vals.get('site.tagline') or 'LAND • DESIGN • DEVELOPMENT • CONSULTANCY',
+        'phone': vals.get('site.phone') or env('COMPANY_PHONE','PHONE',default=''),
+        'email': vals.get('site.email') or env('SMTP_REPLY_TO','EMAIL_REPLY_TO',default=''),
+        'location': vals.get('site.location') or '',
+        'logo_drive_id': vals.get('site.logoDriveId') or '',
+    }
+
+def _draw_qr(c, value, x, y, size=24*mm):
+    if not value: return
+    try:
+        widget=qr.QrCodeWidget(value); bounds=widget.getBounds(); w=bounds[2]-bounds[0]; h=bounds[3]-bounds[1]
+        d=Drawing(size,size,transform=[size/w,0,0,size/h,0,0]); d.add(widget); renderPDF.draw(d,c,x,y)
+    except Exception: pass
+
 def build_invoice_pdf(invoice):
-    buf=BytesIO(); c=canvas.Canvas(buf, pagesize=A4); w,h=A4
-    company=os.getenv('COMPANY_NAME','Gavin Land & Design Consultants')
-    contact=' • '.join(x for x in [os.getenv('SMTP_FROM',''), env('COMPANY_PHONE','PHONE', default='')] if x)
+    buf=BytesIO(); c=canvas.Canvas(buf,pagesize=A4); w,h=A4; company=_company_profile()
     c.setTitle(invoice['invoiceNumber'])
-    c.setFont('Helvetica-Bold',20); c.drawString(25*mm,h-30*mm,company)
-    c.setFont('Helvetica',9); c.drawString(25*mm,h-37*mm,'Land • Design • Development • Project Consultancy')
-    c.setFont('Helvetica-Bold',16); c.drawRightString(w-25*mm,h-30*mm,'INVOICE')
-    c.setFont('Helvetica',9); c.drawRightString(w-25*mm,h-37*mm,invoice['invoiceNumber'])
-    y=h-60*mm
-    c.setFont('Helvetica-Bold',10); c.drawString(25*mm,y,'BILL TO')
-    c.setFont('Helvetica',10); c.drawString(25*mm,y-7*mm,invoice.get('recipientName') or invoice['recipientEmail'])
-    c.drawString(25*mm,y-14*mm,invoice['recipientEmail'])
-    c.setFont('Helvetica-Bold',10); c.drawRightString(w-25*mm,y,'ISSUED')
-    c.setFont('Helvetica',10); c.drawRightString(w-25*mm,y-7*mm,str(invoice.get('issuedAt',''))[:10])
-    c.setFont('Helvetica-Bold',10); c.drawRightString(w-25*mm,y-14*mm,'DUE')
-    c.setFont('Helvetica',10); c.drawRightString(w-25*mm,y-21*mm,invoice.get('dueDate') or 'On receipt')
-    y-=38*mm
-    c.setFont('Helvetica-Bold',10); c.drawString(25*mm,y,'DESCRIPTION'); c.drawRightString(w-25*mm,y,'AMOUNT')
-    c.line(25*mm,y-3*mm,w-25*mm,y-3*mm)
-    c.setFont('Helvetica',10); c.drawString(25*mm,y-12*mm,invoice['description'][:90]); c.drawRightString(w-25*mm,y-12*mm,f"KES {float(invoice['amount']):,.2f}")
-    c.line(25*mm,y-20*mm,w-25*mm,y-20*mm)
-    c.setFont('Helvetica-Bold',12); c.drawRightString(w-25*mm,y-32*mm,f"TOTAL DUE: KES {float(invoice['amount']):,.2f}")
-    c.setFont('Helvetica',9); c.drawString(25*mm,25*mm,'Thank you for choosing GLDC.')
-    if contact: c.drawRightString(w-25*mm,25*mm,contact)
+    # compact one-page professional invoice
+    logo_id=company.get('logo_drive_id')
+    logo_path=os.path.join(os.path.dirname(__file__),'static','assets','gldc-logo.png')
+    try: c.drawImage(ImageReader(logo_path),20*mm,h-35*mm,width=30*mm,height=15*mm,mask='auto')
+    except Exception: pass
+    c.setFont('Helvetica-Bold',16); c.drawString(53*mm,h-23*mm,company['name'])
+    c.setFont('Helvetica',8.5); c.drawString(53*mm,h-29*mm,company['tagline'])
+    c.setFont('Helvetica',8); c.drawString(20*mm,h-35*mm,' • '.join(x for x in [company['phone'],company['email'],company['location']] if x))
+    c.setFont('Helvetica-Bold',17); c.drawRightString(w-20*mm,h-23*mm,'INVOICE')
+    c.setFont('Helvetica',9); c.drawRightString(w-20*mm,h-30*mm,invoice['invoiceNumber'])
+    c.setStrokeColorRGB(.55,.29,.09); c.line(20*mm,h-39*mm,w-20*mm,h-39*mm)
+    y=h-52*mm
+    c.setFont('Helvetica-Bold',9); c.drawString(20*mm,y,'BILL TO'); c.drawRightString(w-20*mm,y,'ISSUED / DUE')
+    c.setFont('Helvetica',9); c.drawString(20*mm,y-6*mm,invoice.get('recipientName') or invoice.get('recipientEmail','')); c.drawString(20*mm,y-12*mm,invoice.get('recipientEmail',''))
+    c.drawRightString(w-20*mm,y-6*mm,str(invoice.get('issuedAt',''))[:10]+'  /  '+(invoice.get('dueDate') or 'On receipt'))
+    y-=28*mm
+    c.setFont('Helvetica-Bold',9); c.drawString(20*mm,y,'DESCRIPTION'); c.drawRightString(w-20*mm,y,'AMOUNT')
+    c.line(20*mm,y-3*mm,w-20*mm,y-3*mm)
+    c.setFont('Helvetica',9); desc=str(invoice.get('description','')); c.drawString(20*mm,y-11*mm,desc[:105]); c.drawRightString(w-20*mm,y-11*mm,f"KES {float(invoice.get('amount',0)):,.2f}")
+    c.line(20*mm,y-18*mm,w-20*mm,y-18*mm)
+    paid=float(invoice.get('amountPaid',0) or 0); total=float(invoice.get('amount',0) or 0); balance=max(total-paid,0)
+    c.setFont('Helvetica',9); c.drawRightString(w-20*mm,y-27*mm,f'Amount paid: KES {paid:,.2f}')
+    c.setFont('Helvetica-Bold',13); c.drawRightString(w-20*mm,y-36*mm,f'BALANCE: KES {balance:,.2f}')
+    qr_value=invoice.get('verificationUrl') or f"{APP_URL}/invoice/{invoice['invoiceNumber']}"
+    _draw_qr(c,qr_value,20*mm,28*mm,25*mm)
+    c.setFont('Helvetica-Bold',8); c.drawString(49*mm,45*mm,'VERIFY / PAY')
+    c.setFont('Helvetica',7.5); c.drawString(49*mm,40*mm,'Scan the QR code to verify this invoice or continue to payment.')
+    c.setFont('Helvetica',7.5); c.drawString(49*mm,35*mm,'Thank you for choosing GLDC.')
+    c.setFont('Helvetica',7.5); c.drawRightString(w-20*mm,25*mm,'Generated electronically • Keep this invoice for your records')
     c.save(); return buf.getvalue()
+
+def build_receipt_pdf(payment, membership=None):
+    buf=BytesIO(); c=canvas.Canvas(buf,pagesize=A4); w,h=A4; company=_company_profile()
+    c.setTitle(payment.get('receiptCode') or payment.get('id','Receipt'))
+    c.setFont('Helvetica-Bold',20); c.drawString(22*mm,h-28*mm,company['name']); c.setFont('Helvetica-Bold',16); c.drawRightString(w-22*mm,h-28*mm,'PAYMENT RECEIPT')
+    c.setFont('Helvetica',9); c.drawString(22*mm,h-35*mm,company['tagline']); c.line(22*mm,h-41*mm,w-22*mm,h-41*mm)
+    y=h-60*mm; rows=[('Receipt code',payment.get('receiptCode') or payment.get('mpesaReceiptNumber') or payment.get('id')),('Member', (membership or {}).get('name') or payment.get('memberName','')),('Email',(membership or {}).get('email') or payment.get('email','')),('Plan',payment.get('planName','')),('Amount',f"KES {float(payment.get('amount',0)):,.2f}"),('Method',payment.get('method','M-PESA')),('Transaction',payment.get('mpesaReceiptNumber') or payment.get('reference') or ''),('Date',str(payment.get('createdAt',''))[:19].replace('T',' '))]
+    for k,v in rows:
+        c.setFont('Helvetica-Bold',9); c.drawString(22*mm,y,k.upper()); c.setFont('Helvetica',10); c.drawString(65*mm,y,str(v)[:90]); y-=11*mm
+    c.setFont('Helvetica',9); c.drawString(22*mm,35*mm,'This receipt confirms payment was recorded. Membership remains subject to GLDC review and approval.')
+    c.save(); return buf.getvalue()
+
+def build_membership_certificate(member, plan, certificate_no):
+    buf=BytesIO(); c=canvas.Canvas(buf,pagesize=A4); w,h=A4
+    c.setTitle(certificate_no)
+    c.setLineWidth(2); c.rect(14*mm,14*mm,w-28*mm,h-28*mm); c.setLineWidth(.6); c.rect(19*mm,19*mm,w-38*mm,h-38*mm)
+    logo_path=os.path.join(os.path.dirname(__file__),'static','assets','gldc-logo.png')
+    try: c.drawImage(ImageReader(logo_path),w/2-25*mm,h-38*mm,width=50*mm,height=25*mm,mask='auto')
+    except Exception: pass
+    c.setFont('Helvetica-Bold',12); c.drawCentredString(w/2,h-48*mm,'GAVIN LAND & DESIGN CONSULTANTS')
+    c.setFont('Helvetica-Bold',24); c.drawCentredString(w/2,h-62*mm,'MEMBERSHIP CERTIFICATE')
+    c.setFont('Helvetica',11); c.drawCentredString(w/2,h-79*mm,'This certifies that')
+    c.setFont('Helvetica-Bold',20); c.drawCentredString(w/2,h-96*mm,str(member.get('name',''))[:70])
+    c.setFont('Helvetica',11); c.drawCentredString(w/2,h-113*mm,'is an approved member of GLDC under the following membership plan:')
+    c.setFont('Helvetica-Bold',14); c.drawCentredString(w/2,h-130*mm,str(plan.get('name',''))[:60])
+    c.setFont('Helvetica',10); c.drawCentredString(w/2,h-145*mm,f"Membership No: {member.get('membershipNumber',member.get('id',''))}")
+    c.drawCentredString(w/2,h-153*mm,f"Valid: {str(member.get('validFrom',''))[:10]} to {str(member.get('validUntil',''))[:10]}")
+    c.drawCentredString(w/2,h-161*mm,f"Certificate: {certificate_no}")
+    _draw_qr(c,f"{APP_URL}/members/{member.get('profileSlug','')}",w/2-15*mm,34*mm,30*mm)
+    c.setFont('Helvetica',8); c.drawCentredString(w/2,29*mm,'Scan to view the member profile / verify certificate.')
+    c.save(); return buf.getvalue()
+
+def email_template_render(name, variables):
+    if db is None: return None
+    t=db.email_templates.find_one({'name':name},{'_id':0})
+    if not t: return None
+    subject=str(t.get('subject','')); html=str(t.get('html','')); text=str(t.get('text',''))
+    for k,v in variables.items():
+        token='{{'+k+'}}'; subject=subject.replace(token,str(v)); html=html.replace(token,str(v)); text=text.replace(token,str(v))
+    return subject, text, html
 
 def request_otp(email):
     if db is None: raise RuntimeError('DATABASE_UNAVAILABLE')
@@ -329,6 +402,20 @@ def drive_files(minimum=40, max_files=200):
             break
     return files[:limit]
 
+
+def drive_upload_bytes(filename, data, mimetype, folder=None):
+    if not env_bool('GOOGLE_DRIVE_ENABLED', default=True): raise RuntimeError('GOOGLE_DRIVE_DISABLED')
+    from googleapiclient.http import MediaIoBaseUpload
+    d=google_service('drive',['https://www.googleapis.com/auth/drive'])
+    parent=folder or os.getenv('GOOGLE_DRIVE_FOLDER_ID','')
+    if not parent: raise RuntimeError('GOOGLE_DRIVE_FOLDER_NOT_CONFIGURED')
+    media=MediaIoBaseUpload(BytesIO(data),mimetype=mimetype,resumable=False)
+    meta={'name':filename,'parents':[parent]}
+    return d.files().create(body=meta,media_body=media,fields='id,name,mimeType,size,webViewLink,webContentLink',supportsAllDrives=True).execute()
+
+def drive_download_bytes_by_id(file_id):
+    meta=drive_metadata(file_id)[2]
+    return _drive_download_direct(file_id,meta,'Drive file download')
 
 def _drive_download_bytes(http_request, label='Drive download'):
     """Download Drive media/export content into bytes safely."""
@@ -562,7 +649,14 @@ def inject_security():
     return {'csrf_token': csrf_token}
 
 @app.context_processor
-def globals_(): return {'current_user':current_user(),'currency':CURRENCY,'year':datetime.now().year,'admin_path':ADMIN_PATH,'app_url':APP_URL}
+def globals_():
+    whatsapp_url=''; hero_image_url=''
+    if db is not None:
+        try:
+            w=db.settings.find_one({'key':'whatsapp'}) or {}; whatsapp_url=w.get('url','') if w.get('enabled') else ''
+            m=db.media.find_one({'slot':'home.hero','status':'PUBLISHED'}) or {}; hero_image_url=f'/api/public/media/{m.get("driveFileId")}' if m.get('driveFileId') else ''
+        except Exception: pass
+    return {'current_user':current_user(),'currency':CURRENCY,'year':datetime.now().year,'admin_path':ADMIN_PATH,'app_url':APP_URL,'whatsapp_url':whatsapp_url,'hero_image_url':hero_image_url}
 
 @app.get('/api/health')
 def api_health():
@@ -618,7 +712,7 @@ def contact(): return render_template('contact.html', title='Contact')
 @app.route('/quote')
 def quote(): return render_template('quote.html', title='Request a Quote')
 @app.route('/member')
-def member(): return render_template('member.html', title='Member Area')
+def member(): return redirect('/membership')
 @app.route('/verify')
 def verify_page(): return render_template('verify.html', title='Verification')
 @app.route('/document')
@@ -640,9 +734,28 @@ def privacy(): return render_template('privacy.html', title='Privacy Policy')
 @app.route('/terms')
 def terms(): return render_template('terms.html', title='Terms & Conditions')
 
+@app.route('/admin/setup')
+def admin_setup():
+    if db is None or not ensure_database_initialized(): return render_template('404.html',title='Page not found'),404
+    bootstrap_admin()
+    if db.users.count_documents({'role':'SUPER ADMIN / OWNER'})>0: return render_template('404.html',title='Page not found'),404
+    return render_template('admin_setup.html',title='Initialize GLDC Administration')
+
 @app.route('/admin')
 @app.route(ADMIN_PATH)
-def admin(): return render_template('admin.html', title='Management Console')
+def admin():
+    if db is None or not ensure_database_initialized(): return render_template('404.html',title='Page not found'),404
+    if db.users.count_documents({'role':'SUPER ADMIN / OWNER'})==0: return render_template('404.html',title='Page not found'),404
+    return render_template('admin.html', title='Management Console')
+
+@app.post('/api/admin/setup')
+def admin_setup_create():
+    if db is None or not ensure_database_initialized(): return json_error('Service unavailable.',503,'SERVICE_UNAVAILABLE')
+    if db.users.count_documents({'role':'SUPER ADMIN / OWNER'})>0: return json_error('Administration is already initialized.',409,'ADMIN_ALREADY_INITIALIZED')
+    b=request.get_json(silent=True) or {}; email=str(b.get('email','')).strip().lower(); name=str(b.get('name','')).strip(); phone=str(b.get('phone','')).strip(); password=str(b.get('password',''))
+    if '@' not in email or len(name)<2 or len(password)<12: return json_error('Name, valid email and 12+ character password are required.',422,'VALIDATION_ERROR')
+    doc={'id':make_id('USR'),'email':email,'name':name,'phone':phone,'passwordHash':hash_password(password),'role':'SUPER ADMIN / OWNER','status':'ACTIVE','createdAt':now(),'updatedAt':now()}
+    db.users.insert_one(doc); audit('FIRST_ADMIN_INITIALIZED','user',doc['id']); return jsonify(ok=True,message='Administration initialized. You can now sign in.')
 
 @app.post('/api/auth/login')
 def api_login():
@@ -961,6 +1074,14 @@ def api_callback():
         success=int(cb.get('ResultCode',1))==0; update={'status':'SUCCESSFUL' if success else 'FAILED','resultCode':cb.get('ResultCode'),'resultDescription':cb.get('ResultDesc'),'updatedAt':now()}
         if success: update.update({'mpesaReceiptNumber':vals.get('MpesaReceiptNumber'),'transactionDate':vals.get('TransactionDate'),'phoneNumber':vals.get('PhoneNumber'),'amount':vals.get('Amount')})
         db.payments.update_one({'_id':p['_id']},{'$set':update}); db.audit.insert_one({'action':'PAYMENT_SUCCESS' if success else 'PAYMENT_FAILED','entity':p['id'],'createdAt':now(),'result':cb.get('ResultDesc')})
+        if success and p.get('memberId'):
+            m=db.members.find_one({'id':p.get('memberId')}); plan=db.membership_plans.find_one({'id':p.get('planId')})
+            if m:
+                db.members.update_one({'_id':m['_id']},{'$set':{'status':'PENDING_REVIEW','paymentId':p['id'],'paymentReceiptCode':p.get('receiptCode'),'updatedAt':now()}})
+                p.update(update)
+                try:
+                    receipt=build_receipt_pdf(p,m); _send_member_email('membership_payment_receipt',m,{'name':m.get('name',''),'plan':p.get('planName',''),'amount':p.get('amount'),'receiptCode':p.get('receiptCode'),'subject':'GLDC Membership Payment Receipt','text':f'We received your membership payment. Receipt: {p.get("receiptCode")}.','html':f'<div style="font-family:Arial;max-width:640px;margin:auto"><h2 style="color:#8B4A18">Payment received</h2><p>Dear {m.get("name","")},</p><p>Your payment for <b>{p.get("planName","")}</b> has been received and your application is now awaiting GLDC review.</p><p><b>Receipt:</b> {p.get("receiptCode")}<br><b>Amount:</b> KES {float(p.get("amount",0)):,.2f}</p><p>Your payment receipt is attached.</p></div>'},[('GLDC-Receipt-'+str(p.get('receiptCode'))+'.pdf',receipt,'application/pdf')])
+                except Exception: app.logger.exception('Membership receipt email failed')
         return jsonify(ResultCode=0,ResultDesc='Accepted')
     except Exception: return jsonify(ResultCode=0,ResultDesc='Accepted')
 
@@ -974,6 +1095,260 @@ def public_consultation():
 @app.get('/api/admin/consultations')
 @admin_required
 def admin_consultations(): return jsonify(ok=True,consultations=list_collection('consultations'))
+
+# ================= MEMBERSHIP PLATFORM V14 =================
+def _slugify(v):
+    x=re.sub(r'[^a-z0-9]+','-',str(v).lower()).strip('-'); return x or secrets.token_hex(4)
+
+def _membership_plan(name):
+    return db.membership_plans.find_one({'id':name,'status':'ACTIVE'}) or db.membership_plans.find_one({'slug':name,'status':'ACTIVE'})
+
+def _member_session():
+    u=current_user(); return u if u and u.get('role')=='MEMBER' else None
+
+def _member_doc():
+    u=_member_session()
+    return db.members.find_one({'id':u.get('memberId')}) if u and u.get('memberId') else (db.members.find_one({'email':u.get('email')}) if u else None)
+
+def _member_public(m):
+    if not m: return None
+    return {k:clean_doc(m).get(k) for k in ['id','membershipNumber','name','profileSlug','bio','profession','company','location','phone','email','status','membershipPlan','validFrom','validUntil','photoDriveId']}
+
+def _send_member_email(kind, member, variables, attachments=None):
+    rendered=email_template_render(kind,variables)
+    if rendered: subject,text,html=rendered
+    else:
+        subject=variables.get('subject','GLDC Membership Update'); text=variables.get('text',''); html=variables.get('html','<p>'+text+'</p>')
+    send_email(member['email'],subject,text,html,attachments)
+
+@app.route('/membership')
+def membership_page(): return render_template('membership.html',title='GLDC Membership')
+
+@app.route('/member/dashboard')
+def member_dashboard():
+    if not _member_session(): return redirect('/membership')
+    return render_template('member_dashboard.html',title='Member Dashboard')
+
+@app.route('/members/<slug>')
+def member_profile(slug):
+    m=db.members.find_one({'profileSlug':slug,'status':'ACTIVE'}) if db is not None else None
+    if not m: return render_template('404.html',title='Member not found'),404
+    return render_template('member_profile.html',title=m.get('name','GLDC Member'),member=_member_public(m))
+
+@app.get('/api/membership/plans')
+def membership_plans(): return jsonify(ok=True,plans=[clean_doc(x) for x in db.membership_plans.find({'status':'ACTIVE'}).sort('sortOrder',ASCENDING)])
+
+@app.post('/api/membership/register')
+def membership_register_v14():
+    b=request.get_json(silent=True) or {}; name=str(b.get('name','')).strip(); email=str(b.get('email','')).strip().lower(); phone=str(b.get('phone','')).strip()
+    if len(name)<2 or '@' not in email or len(phone)<7: return json_error('Name, valid email and phone are required.',422,'VALIDATION_ERROR')
+    if db.members.find_one({'email':email,'status':{'$in':['ACTIVE','PENDING_PAYMENT','PENDING_REVIEW','APPROVED']}}): return json_error('A membership account already exists for this email.',409,'MEMBER_EXISTS')
+    member={'id':make_id('MEM'),'membershipNumber':'PENDING-'+secrets.token_hex(4).upper(),'name':name,'email':email,'phone':phone,'profileSlug':_slugify(name)+'-'+secrets.token_hex(3),'status':'EMAIL_PENDING','emailVerified':False,'createdAt':now(),'updatedAt':now(),'bio':str(b.get('bio','')).strip(),'profession':str(b.get('profession','')).strip(),'company':str(b.get('company','')).strip(),'location':str(b.get('location','')).strip(),'portfolioUrl':str(b.get('portfolioUrl','')).strip()}
+    db.members.insert_one(member); request_otp(email); audit('MEMBERSHIP_REGISTERED','member',member['id']); return jsonify(ok=True,memberId=member['id'],message='Verification code sent to your email.')
+
+@app.post('/api/membership/verify')
+def membership_verify_v14():
+    b=request.get_json(silent=True) or {}; email=str(b.get('email','')).strip().lower(); code=str(b.get('code','')).strip()
+    try: verify_otp(email,code)
+    except RuntimeError as e: return json_error('The verification code is invalid or expired.',400,str(e))
+    m=db.members.find_one({'email':email})
+    if not m: return json_error('Membership account not found.',404,'MEMBER_NOT_FOUND')
+    db.members.update_one({'_id':m['_id']},{'$set':{'emailVerified':True,'status':'PENDING_PAYMENT','updatedAt':now()}})
+    session['user']={'id':str(m['_id']),'memberId':m['id'],'email':email,'name':m.get('name',''),'role':'MEMBER'}
+    audit('MEMBERSHIP_EMAIL_VERIFIED','member',m['id']); return jsonify(ok=True,user=session['user'],status='PENDING_PAYMENT')
+
+@app.post('/api/membership/profile')
+@login_required
+def membership_profile_update():
+    m=_member_doc()
+    if not m: return json_error('Member account not found.',404,'MEMBER_NOT_FOUND')
+    b=request.get_json(silent=True) or {}; allowed=['name','phone','bio','profession','company','location','portfolioUrl']
+    update={k:str(b[k]).strip() for k in allowed if k in b}; update['updatedAt']=now(); update['profileSlug']=_slugify(update.get('name',m.get('name','')))+'-'+str(m.get('id',''))[-6:].lower()
+    db.members.update_one({'_id':m['_id']},{'$set':update}); audit('MEMBER_PROFILE_UPDATED','member',m['id']); return jsonify(ok=True,member=_member_public({**m,**update}))
+
+@app.post('/api/membership/documents')
+@login_required
+def membership_document_upload():
+    m=_member_doc()
+    if not m: return json_error('Member account not found.',404,'MEMBER_NOT_FOUND')
+    f=request.files.get('file')
+    if not f or not f.filename: return json_error('Choose a file.',422,'FILE_REQUIRED')
+    data=f.read(); mt=f.mimetype or 'application/octet-stream'; ext=f.filename.rsplit('.',1)[-1].lower() if '.' in f.filename else ''
+    if ext not in {'pdf','jpg','jpeg','png','webp','doc','docx'}: return json_error('Allowed files: PDF, image, DOC or DOCX.',422,'FILE_TYPE_NOT_ALLOWED')
+    if len(data)>2*1024*1024: return json_error('File must be 2 MB or smaller.',413,'PAYLOAD_TOO_LARGE')
+    category=str(request.form.get('category','SUPPORTING DOCUMENT')).upper()
+    if category=='PASSPORT PHOTO' and ext not in {'jpg','jpeg','png','webp'}: return json_error('Passport photo must be an image.',422,'FILE_TYPE_NOT_ALLOWED')
+    try: drive=drive_upload_bytes(f"{m['id']}-{category.replace(' ','-')}-{f.filename}",data,mt)
+    except Exception as e: app.logger.exception('Member Drive upload failed'); return json_error('Unable to store the file in Google Drive.',503,'DRIVE_UPLOAD_FAILED')
+    rec={'id':make_id('MDOC'),'memberId':m['id'],'category':category,'name':f.filename,'driveFileId':drive.get('id'),'mimeType':mt,'size':len(data),'createdAt':now(),'createdBy':m['email']}
+    db.member_documents.insert_one(rec)
+    if category=='PASSPORT PHOTO': db.members.update_one({'_id':m['_id']},{'$set':{'photoDriveId':drive.get('id'),'photoName':f.filename,'updatedAt':now()}})
+    audit('MEMBER_DOCUMENT_UPLOADED','member',m['id'],{'category':category,'driveFileId':drive.get('id')}); return jsonify(ok=True,document=clean_doc(rec))
+
+@app.get('/api/members/me')
+@login_required
+def membership_me():
+    m=_member_doc()
+    if not m: return json_error('Member account not found.',404,'MEMBER_NOT_FOUND')
+    return jsonify(ok=True,member=_member_public(m),documents=list_collection('member_documents',100))
+
+@app.get('/api/members/photo/<member_id>')
+def member_photo(member_id):
+    m=db.members.find_one({'id':member_id,'status':'ACTIVE'}) if db is not None else None
+    if not m or not m.get('photoDriveId'): return Response('Not found',404)
+    try:
+        data=drive_download_bytes_by_id(m['photoDriveId']); meta=drive_metadata(m['photoDriveId'])[2]; return Response(data,mimetype=meta.get('mimeType','image/jpeg'),headers={'Cache-Control':'public, max-age=3600'})
+    except Exception: return Response('Not found',404)
+
+@app.post('/api/membership/subscribe')
+@login_required
+def membership_subscribe():
+    m=_member_doc()
+    if not m or not m.get('emailVerified'): return json_error('Verify your email before subscribing.',403,'EMAIL_NOT_VERIFIED')
+    b=request.get_json(silent=True) or {}; plan=_membership_plan(str(b.get('planId','')))
+    if not plan: return json_error('Membership plan not found.',404,'PLAN_NOT_FOUND')
+    if m.get('status') not in {'PENDING_PAYMENT','PAYMENT_FAILED','EMAIL_PENDING'}: return json_error('This membership is already in review or active.',409,'MEMBERSHIP_STATE')
+    amount=float(plan['price']); pid=make_id('PAY'); receipt='GLDC-RCP-'+secrets.token_hex(5).upper()
+    pay={'id':pid,'memberId':m['id'],'email':m['email'],'phone':m['phone'],'amount':amount,'currency':'KES','planId':plan['id'],'planName':plan['name'],'method':'M-PESA','status':'PENDING','receiptCode':receipt,'createdAt':now(),'updatedAt':now(),'source':'MEMBERSHIP'}
+    db.payments.insert_one(pay)
+    try:
+        r=daraja_stk(m['phone'],int(amount),m['membershipNumber'],f"GLDC {plan['name']} membership")
+        db.payments.update_one({'id':pid},{'$set':{'merchantRequestId':r.get('MerchantRequestID'),'checkoutRequestId':r.get('CheckoutRequestID'),'responseDescription':r.get('ResponseDescription')}})
+        db.members.update_one({'_id':m['_id']},{'$set':{'status':'PAYMENT_PENDING','membershipPlan':plan['name'],'membershipPlanId':plan['id'],'updatedAt':now()}})
+        return jsonify(ok=True,paymentId=pid,receiptCode=receipt,status='PENDING',message=r.get('CustomerMessage','Payment prompt sent.'))
+    except Exception as e:
+        db.payments.update_one({'id':pid},{'$set':{'status':'FAILED','updatedAt':now(),'error':str(e)}}); db.members.update_one({'_id':m['_id']},{'$set':{'status':'PAYMENT_FAILED','updatedAt':now()}}); return json_error('Unable to start membership payment.',502,'PAYMENT_FAILED')
+
+@app.get('/api/admin/membership/plans')
+@admin_required
+def admin_membership_plans(): return jsonify(ok=True,plans=list_collection('membership_plans',100))
+
+@app.post('/api/admin/membership/plans')
+@admin_required
+def admin_membership_plan_create():
+    b=request.get_json(silent=True) or {}; name=str(b.get('name','')).strip(); price=float(b.get('price',0) or 0); months=int(b.get('months',1) or 1)
+    if not name or price<=0 or months<=0: return json_error('Plan name, price and duration are required.',422,'VALIDATION_ERROR')
+    doc={'id':make_id('PLAN'),'slug':_slugify(name),'name':name,'price':price,'currency':'KES','months':months,'billingCycle':'YEARLY' if months>=12 else 'MONTHLY','status':str(b.get('status','ACTIVE')).upper(),'description':str(b.get('description','')).strip(),'sortOrder':int(b.get('sortOrder',0) or 0),'createdAt':now(),'updatedAt':now()}
+    db.membership_plans.insert_one(doc); audit('MEMBERSHIP_PLAN_CREATED','membership_plan',doc['id']); return jsonify(ok=True,plan=clean_doc(doc)),201
+
+@app.patch('/api/admin/membership/plans/<plan_id>')
+@admin_required
+def admin_membership_plan_update(plan_id):
+    b=request.get_json(silent=True) or {}; allowed=['name','price','months','billingCycle','status','description','sortOrder']; u={k:b[k] for k in allowed if k in b}; u['updatedAt']=now(); db.membership_plans.update_one({'id':plan_id},{'$set':u}); audit('MEMBERSHIP_PLAN_UPDATED','membership_plan',plan_id,u); return jsonify(ok=True)
+
+@app.get('/api/admin/members')
+@admin_required
+def admin_members_v14(): return jsonify(ok=True,members=list_collection('members',500))
+
+@app.post('/api/admin/members/<member_id>/decision')
+@admin_required
+def admin_member_decision(member_id):
+    b=request.get_json(silent=True) or {}; decision=str(b.get('decision','')).upper(); m=db.members.find_one({'id':member_id})
+    if not m: return json_error('Member not found.',404,'MEMBER_NOT_FOUND')
+    if decision not in {'APPROVE','REQUEST_CHANGES','REJECT'}: return json_error('Invalid decision.',422,'VALIDATION_ERROR')
+    if decision=='APPROVE':
+        plan=_membership_plan(m.get('membershipPlanId','')) or db.membership_plans.find_one({'name':m.get('membershipPlan')})
+        if not plan: return json_error('Membership plan not found.',409,'PLAN_NOT_FOUND')
+        from_date=now(); valid=from_date+timedelta(days=30*int(plan.get('months',1))); cert='GLDC-CERT-'+secrets.token_hex(5).upper(); number='GLDC-M-'+secrets.token_hex(4).upper()
+        update={'status':'ACTIVE','membershipNumber':number,'validFrom':from_date,'validUntil':valid,'certificateNumber':cert,'approvedAt':now(),'approvedBy':current_user().get('email'),'updatedAt':now()}
+        db.members.update_one({'_id':m['_id']},{'$set':update}); m.update(update); pdf=build_membership_certificate(m,plan,cert)
+        try: drive=drive_upload_bytes(f'{cert}.pdf',pdf,'application/pdf'); db.members.update_one({'_id':m['_id']},{'$set':{'certificateDriveId':drive.get('id')}})
+        except Exception: app.logger.exception('Certificate Drive archive failed')
+        _send_member_email('membership_certificate',m,{'name':m['name'],'membershipNumber':number,'plan':plan['name'],'validUntil':str(valid)[:10],'certificateNumber':cert,'subject':'Your GLDC Membership Certificate','text':f'Congratulations {m["name"]}. Your GLDC membership has been approved.','html':f'<div style="font-family:Arial;max-width:640px;margin:auto"><h2 style="color:#8B4A18">Welcome to GLDC Membership</h2><p>Dear {m["name"]},</p><p>Your membership has been approved and your certificate is attached.</p><p><b>Membership:</b> {plan["name"]}<br><b>Membership No:</b> {number}<br><b>Valid until:</b> {str(valid)[:10]}</p><p>Keep your certificate for your records.</p><p style="color:#777">Gavin Land & Design Consultants</p></div>'},[('GLDC-'+cert+'.pdf',pdf,'application/pdf')])
+    else:
+        status='CHANGES_REQUIRED' if decision=='REQUEST_CHANGES' else 'REJECTED'; note=str(b.get('message','Please review and update your membership details.')).strip(); db.members.update_one({'_id':m['_id']},{'$set':{'status':status,'adminMessage':note,'updatedAt':now()}}); edit_url=f'{APP_URL}/member/dashboard?edit=1'; _send_member_email('membership_changes',m,{'name':m['name'],'message':note,'editUrl':edit_url,'subject':'GLDC Membership – action required','text':f'Please review your membership details: {edit_url}','html':f'<div style="font-family:Arial;max-width:640px;margin:auto"><h2 style="color:#8B4A18">Membership details need your attention</h2><p>Dear {m["name"]},</p><p>{note}</p><p><a href="{edit_url}" style="display:inline-block;padding:12px 18px;background:#8B4A18;color:white;text-decoration:none;border-radius:6px">EDIT MY DETAILS</a></p></div>'})
+    audit('MEMBERSHIP_DECISION','member',member_id,{'decision':decision}); return jsonify(ok=True,status='ACTIVE' if decision=='APPROVE' else ('CHANGES_REQUIRED' if decision=='REQUEST_CHANGES' else 'REJECTED'))
+
+@app.get('/api/admin/membership/recover/<receipt_code>')
+@admin_required
+def admin_membership_recover(receipt_code):
+    p=db.payments.find_one({'receiptCode':receipt_code});
+    if not p: return json_error('Payment receipt not found.',404,'RECEIPT_NOT_FOUND')
+    m=db.members.find_one({'id':p.get('memberId')}); return jsonify(ok=True,payment=clean_doc(p),member=clean_doc(m) if m else None)
+
+@app.get('/api/admin/email-templates')
+@admin_required
+def admin_email_templates(): return jsonify(ok=True,templates=list_collection('email_templates',100))
+
+@app.post('/api/admin/email-templates')
+@admin_required
+def admin_email_template_save():
+    b=request.get_json(silent=True) or {}; name=str(b.get('name','')).strip(); subject=str(b.get('subject','')).strip(); html=str(b.get('html','')); text=str(b.get('text',''))
+    if not name or not subject or not html: return json_error('Template name, subject and HTML are required.',422,'VALIDATION_ERROR')
+    doc={'name':name,'subject':subject,'html':html,'text':text,'updatedAt':now(),'updatedBy':current_user().get('email')}; db.email_templates.update_one({'name':name},{'$set':doc,'$setOnInsert':{'createdAt':now()}},upsert=True); audit('EMAIL_TEMPLATE_SAVED','email_template',name); return jsonify(ok=True)
+
+@app.post('/api/admin/email-templates/test')
+@admin_required
+def admin_email_template_test():
+    b=request.get_json(silent=True) or {}; to=str(b.get('to','')).strip().lower(); subject=str(b.get('subject','')).strip(); html=str(b.get('html','')); text=str(b.get('text',''))
+    if '@' not in to: return json_error('Valid recipient email required.',422,'VALIDATION_ERROR')
+    send_email(to,subject,text,html); audit('EMAIL_TEMPLATE_TEST_SENT','email_template',str(b.get('name',''))); return jsonify(ok=True)
+
+@app.get('/api/public/media/<file_id>')
+def public_media(file_id):
+    if db is None: return Response('Not found',404)
+    media=db.media.find_one({'driveFileId':file_id,'status':'PUBLISHED'})
+    if not media: return Response('Not found',404)
+    try:
+        data=drive_download_bytes_by_id(file_id); meta=drive_metadata(file_id)[2]; return Response(data,mimetype=meta.get('mimeType','image/jpeg'),headers={'Cache-Control':'public, max-age=3600'})
+    except Exception: return Response('Not found',404)
+
+@app.get('/locations')
+def public_locations(): return render_template('locations.html',title='GLDC Offices & Locations')
+
+@app.get('/api/public/locations')
+def public_locations_api(): return jsonify(ok=True,locations=list_collection('office_locations',100))
+
+@app.get('/api/admin/media')
+@admin_required
+def admin_media(): return jsonify(ok=True,media=list_collection('media',300))
+
+@app.post('/api/admin/media')
+@admin_required
+def admin_media_save():
+    b=request.get_json(silent=True) or {}; slot=str(b.get('slot','')).strip(); drive_id=str(b.get('driveFileId','')).strip(); name=str(b.get('name','')).strip()
+    if not slot or not drive_id: return json_error('Media slot and Google Drive file ID are required.',422,'VALIDATION_ERROR')
+    doc={'id':make_id('MED'),'slot':slot,'name':name or slot,'driveFileId':drive_id,'status':str(b.get('status','PUBLISHED')).upper(),'alt':str(b.get('alt','GLDC image')).strip(),'position':str(b.get('position','center center')).strip(),'updatedAt':now(),'updatedBy':current_user().get('email')}
+    db.media.update_one({'slot':slot},{'$set':doc,'$setOnInsert':{'createdAt':now()}},upsert=True); audit('MEDIA_SLOT_UPDATED','media',slot,{'driveFileId':drive_id}); return jsonify(ok=True,media=clean_doc(doc))
+
+@app.patch('/api/admin/media/<media_id>')
+@admin_required
+def admin_media_update(media_id):
+    b=request.get_json(silent=True) or {}; allowed=['slot','name','driveFileId','status','alt','position']; u={k:b[k] for k in allowed if k in b}; u['updatedAt']=now(); db.media.update_one({'id':media_id},{'$set':u}); audit('MEDIA_UPDATED','media',media_id,u); return jsonify(ok=True)
+
+@app.get('/api/admin/whatsapp')
+@admin_required
+def admin_whatsapp():
+    x=db.settings.find_one({'key':'whatsapp'},{'_id':0}) or {'key':'whatsapp','enabled':False,'phone':'','url':'','message':'Hello GLDC, I would like to make an enquiry.','label':'WhatsApp'}; return jsonify(ok=True,whatsapp=x)
+
+@app.post('/api/admin/whatsapp')
+@admin_required
+def admin_whatsapp_save():
+    b=request.get_json(silent=True) or {}; phone=re.sub(r'\\D','',str(b.get('phone',''))); url=str(b.get('url','')).strip(); enabled=bool(b.get('enabled',True)); msg=str(b.get('message','Hello GLDC, I would like to make an enquiry.')).strip()
+    if phone and not url: url='https://wa.me/'+phone+'?text='+requests.utils.quote(msg)
+    doc={'key':'whatsapp','enabled':enabled,'phone':phone,'url':url,'message':msg,'label':str(b.get('label','WhatsApp')).strip(),'updatedAt':now(),'updatedBy':current_user().get('email')}; db.settings.update_one({'key':'whatsapp'},{'$set':doc},upsert=True); audit('WHATSAPP_SETTINGS_UPDATED','settings','whatsapp'); return jsonify(ok=True,whatsapp=clean_doc(doc))
+
+@app.get('/api/admin/locations')
+@admin_required
+def admin_locations(): return jsonify(ok=True,locations=list_collection('office_locations',100))
+
+@app.post('/api/admin/locations')
+@admin_required
+def admin_location_create():
+    b=request.get_json(silent=True) or {}; name=str(b.get('name','')).strip(); lat=float(b.get('lat',0) or 0); lng=float(b.get('lng',0) or 0)
+    if not name or not (-90<=lat<=90 and -180<=lng<=180): return json_error('Office name and valid map coordinates are required.',422,'VALIDATION_ERROR')
+    doc={'id':make_id('OFF'),'name':name,'address':str(b.get('address','')).strip(),'description':str(b.get('description','')).strip(),'phone':str(b.get('phone','')).strip(),'email':str(b.get('email','')).strip(),'hours':str(b.get('hours','')).strip(),'lat':lat,'lng':lng,'zoom':int(b.get('zoom',15) or 15),'primary':bool(b.get('primary',False)),'status':'PUBLISHED','createdAt':now(),'updatedAt':now()}; db.office_locations.insert_one(doc); audit('OFFICE_LOCATION_CREATED','office',doc['id']); return jsonify(ok=True,location=clean_doc(doc)),201
+
+@app.patch('/api/admin/locations/<location_id>')
+@admin_required
+def admin_location_update(location_id):
+    b=request.get_json(silent=True) or {}; allowed=['name','address','description','phone','email','hours','lat','lng','zoom','primary','status']; u={k:b[k] for k in allowed if k in b}; u['updatedAt']=now(); db.office_locations.update_one({'id':location_id},{'$set':u}); audit('OFFICE_LOCATION_UPDATED','office',location_id,u); return jsonify(ok=True)
+
+@app.get('/invoice/<invoice_number>')
+def invoice_verify_page(invoice_number):
+    inv=db.invoices.find_one({'invoiceNumber':invoice_number},{'_id':0,'invoiceNumber':1,'status':1,'issuedAt':1,'dueDate':1}) if db is not None else None
+    if not inv: return render_template('404.html',title='Invoice not found'),404
+    return render_template('invoice_verify.html',title='Invoice Verification',invoice=clean_doc(inv))
 
 @app.get('/api/public/content')
 def api_public_content():
@@ -1279,6 +1654,22 @@ def init_database():
     db.projects.create_index([('clientId',ASCENDING),('status',ASCENDING)])
     db.posts.create_index([('status',ASCENDING),('publishedAt',DESCENDING)])
     db.consultations.create_index([('scheduledAt',ASCENDING),('status',ASCENDING)])
+    db.membership_plans.create_index([('status',ASCENDING),('sortOrder',ASCENDING)])
+    db.member_documents.create_index([('memberId',ASCENDING),('category',ASCENDING),('createdAt',DESCENDING)])
+    db.email_templates.create_index([('name',ASCENDING)], unique=True)
+    db.media.create_index([('slot',ASCENDING)], unique=True)
+    db.office_locations.create_index([('status',ASCENDING),('primary',DESCENDING)])
+    plans=[
+        {'slug':'monthly','name':'Monthly Membership','price':1000,'months':1,'billingCycle':'MONTHLY','description':'Flexible month-to-month GLDC membership.','sortOrder':1},
+        {'slug':'yearly','name':'Annual Membership','price':10000,'months':12,'billingCycle':'YEARLY','description':'Best value annual GLDC membership.','sortOrder':2},
+    ]
+    for pl in plans: db.membership_plans.update_one({'slug':pl['slug']},{'$setOnInsert':{'id':'PLAN-'+pl['slug'].upper(),'status':'ACTIVE','currency':'KES','createdAt':now()},'$set':{**pl,'updatedAt':now()}},upsert=True)
+    email_defaults={
+      'membership_payment_receipt':{'subject':'GLDC Membership Payment Receipt – {{receiptCode}}','text':'Dear {{name}}, your payment of KES {{amount}} has been received. Receipt {{receiptCode}}.','html':'<div style=\"font-family:Arial;max-width:640px;margin:auto\"><div style=\"padding:24px;background:#8B4A18;color:#fff\"><h2>GLDC Membership</h2></div><div style=\"padding:24px\"><p>Dear <b>{{name}}</b>,</p><p>We have received your payment for <b>{{plan}}</b>.</p><p><b>Amount:</b> KES {{amount}}<br><b>Receipt:</b> {{receiptCode}}</p><p>Your application is now awaiting membership review. The receipt PDF is attached.</p></div></div>'},
+      'membership_changes':{'subject':'GLDC Membership – action required','text':'Dear {{name}}, {{message}} Please use {{editUrl}} to update your details.','html':'<div style=\"font-family:Arial;max-width:640px;margin:auto\"><h2 style=\"color:#8B4A18\">Membership details need your attention</h2><p>Dear {{name}},</p><p>{{message}}</p><p><a href=\"{{editUrl}}\" style=\"background:#8B4A18;color:#fff;padding:12px 18px;text-decoration:none\">EDIT MY DETAILS</a></p></div>'},
+      'membership_certificate':{'subject':'Your GLDC Membership Certificate – {{certificateNumber}}','text':'Congratulations {{name}}. Your GLDC membership certificate is attached.','html':'<div style=\"font-family:Arial;max-width:640px;margin:auto\"><div style=\"padding:24px;background:#8B4A18;color:#fff\"><h2>Membership Approved</h2></div><div style=\"padding:24px\"><p>Dear <b>{{name}}</b>,</p><p>Your GLDC membership has been approved. Your certificate is attached.</p><p><b>Plan:</b> {{plan}}<br><b>Membership No:</b> {{membershipNumber}}<br><b>Valid until:</b> {{validUntil}}</p></div></div>'}
+    }
+    for name,t in email_defaults.items(): db.email_templates.update_one({'name':name},{'$setOnInsert':{'name':name,'createdAt':now()},'$set':t},upsert=True)
     defaults={'home.heroTitle':'Land. Design. Development. Done Right.','home.heroText':'Professional land, planning, design and development consultancy for clients who need practical outcomes.','home.primaryCta':'REQUEST A QUOTE','home.secondaryCta':'VIEW PROJECTS','site.company':'Gavin Land & Design Consultants','site.tagline':'Land • Design • Development • Consultancy','site.phone':'+254','site.email':'info@yourdomain.co.ke','site.location':'Kenya'}
     for key,value in defaults.items(): db.content.update_one({'key':key},{'$setOnInsert':{'key':key,'value':value,'public':True,'createdAt':now()}},upsert=True)
     db.tasks.create_index([('projectId',ASCENDING),('status',ASCENDING)])
