@@ -1,0 +1,14 @@
+{% extends 'base.html' %}
+{% block content %}
+<section class="section"><div class="container">
+<span class="eyebrow">GLDC MEMBER DIRECTORY</span><h1>Meet our members</h1><p class="mutedx" style="max-width:760px">Explore approved GLDC members and their professional profiles. Only active, approved members are published in the directory.</p>
+<div id="membersGrid" class="grid grid-3" style="margin-top:28px"></div>
+</div></section>
+{% endblock %}
+{% block scripts %}
+<style>.member-directory-card{background:#fff;border:1px solid #e8dfd5;border-radius:18px;padding:22px}.member-avatar{width:72px;height:72px;border-radius:50%;object-fit:cover;background:#f1ece6;display:grid;place-items:center;font-weight:800;color:#8b4a18;font-size:25px;margin-bottom:15px}.member-directory-card h2{margin:0 0 6px}.member-directory-card .mutedx{min-height:42px}.member-directory-card .btn{margin-top:12px}</style>
+<script>
+function esc(v){return String(v??'').replace(/[&<>"']/g,x=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[x]))}
+async function loadMembers(){const el=document.getElementById('membersGrid');try{const r=await fetch('/api/members');const j=await r.json();const ms=j.members||[];el.innerHTML=ms.length?ms.map(m=>{const initials=(m.name||'GL').split(/\s+/).slice(0,2).map(x=>x[0]).join('').toUpperCase();const img=m.photoDriveId?`<img class="member-avatar" src="/api/members/photo/${encodeURIComponent(m.id)}" alt="${esc(m.name)}">`:`<div class="member-avatar">${esc(initials)}</div>`;return `<article class="member-directory-card">${img}<h2>${esc(m.name)}</h2><p><b>${esc(m.profession||'GLDC Member')}</b></p><p class="mutedx">${esc(m.company||'')} ${m.location?'· '+esc(m.location):''}</p><a class="btn primary" href="/members/${encodeURIComponent(m.profileSlug)}">VIEW PROFILE</a></article>`}).join(''):'<div class="notice">No approved members are currently published.</div>'}catch(e){el.innerHTML='<div class="notice">We could not load the member directory right now. Please try again.</div>'}}
+loadMembers();
+</script>{% endblock %}
