@@ -2243,19 +2243,46 @@ def membership_profile_photo_upload():
     if ext in {'jpg','jpeg'} and detected_ext!='jpg':
         return json_error('The selected image file does not match its JPG extension.',422,'IMAGE_TYPE_MISMATCH')
     safe_name=f"{m['id']}-PROFILE-PHOTO-{secrets.token_hex(4)}.{detected_ext}"
+    drive=None
+    drive_error=''
     try:
         drive=drive_upload_bytes(safe_name,data,mime)
     except Exception as e:
-        app.logger.exception('Member profile photo Drive upload failed')
-        msg=str(e)
-        if 'GOOGLE_DRIVE_FOLDER_ACCESS_DENIED' in msg:
-            return json_error('Your profile picture could not be stored because the configured Google Drive folder is not writable. Share that folder with the GLDC Google service account as Editor/Content manager.',503,'DRIVE_UPLOAD_FAILED')
-        return json_error('Your profile picture could not be stored securely right now. Please try again.',503,'DRIVE_UPLOAD_FAILED')
-    rec={'id':make_id('MDOC'),'memberId':m['id'],'category':'PROFILE PHOTO','name':filename,'driveFileId':drive.get('id'),'mimeType':mime,'size':len(data),'createdAt':now(),'createdBy':m['email']}
+        drive_error=str(e)
+        app.logger.exception('Member profile photo Drive upload failed; attempting encrypted-at-rest database fallback request=%s',getattr(request,'request_id','unknown'))
+
+    # Vercel's filesystem is ephemeral, so never fall back to a local file.
+    # If Google Drive is temporarily unavailable, keep the member photo in a
+    # dedicated MongoDB collection instead. The image is still protected by
+    # the member/public access checks in /api/members/photo/<member_id>.
+    if drive and drive.get('id'):
+        photo_storage='drive'
+        storage_id=str(drive.get('id'))
+    else:
+        try:
+            db.member_profile_photos.update_one(
+                {'memberId':m['id']},
+                {'$set':{'memberId':m['id'],'name':filename,'mimeType':mime,'size':len(data),'data':data,'updatedAt':now()}},
+                upsert=True
+            )
+            photo_storage='mongo'
+            storage_id=m['id']
+        except Exception:
+            app.logger.exception('Member profile photo MongoDB fallback failed request=%s',getattr(request,'request_id','unknown'))
+            if 'GOOGLE_DRIVE_FOLDER_ACCESS_DENIED' in drive_error:
+                return json_error('Your profile picture could not be stored because the configured Google Drive folder is not writable, and the secure database fallback was unavailable. Share the folder with the GLDC Google service account as Editor/Content manager and try again.',503,'PROFILE_PHOTO_STORAGE_UNAVAILABLE')
+            return json_error('Your profile picture could not be stored securely right now. Please try again.',503,'PROFILE_PHOTO_STORAGE_UNAVAILABLE')
+
+    rec={'id':make_id('MDOC'),'memberId':m['id'],'category':'PROFILE PHOTO','name':filename,'driveFileId':drive.get('id') if drive else None,'storage':'DRIVE' if photo_storage=='drive' else 'MONGODB','mimeType':mime,'size':len(data),'createdAt':now(),'createdBy':m['email']}
     db.member_documents.insert_one(rec)
-    db.members.update_one({'_id':m['_id']},{'$set':{'photoDriveId':drive.get('id'),'photoName':filename,'photoMimeType':mime,'updatedAt':now()}})
-    audit('MEMBER_PROFILE_PHOTO_UPDATED','member',m['id'],{'driveFileId':drive.get('id'),'mimeType':mime})
-    return jsonify(ok=True,photo={'driveFileId':drive.get('id'),'mimeType':mime,'name':filename})
+    member_update={'photoName':filename,'photoMimeType':mime,'photoStorage':photo_storage,'updatedAt':now()}
+    if drive:
+        member_update['photoDriveId']=drive.get('id')
+    else:
+        member_update['photoDriveId']=None
+    db.members.update_one({'_id':m['_id']},{'$set':member_update})
+    audit('MEMBER_PROFILE_PHOTO_UPDATED','member',m['id'],{'storage':photo_storage,'driveFileId':drive.get('id') if drive else None,'mimeType':mime})
+    return jsonify(ok=True,photo={'driveFileId':drive.get('id') if drive else None,'storage':photo_storage,'mimeType':mime,'name':filename})
 
 @app.post('/api/membership/profile')
 @login_required
@@ -2310,17 +2337,28 @@ def membership_me():
 @app.get('/api/members/photo/<member_id>')
 def member_photo(member_id):
     m=db.members.find_one({'id':member_id}) if db is not None else None
-    if not m or not m.get('photoDriveId'): return Response('Not found',404)
+    if not m: return Response('Not found',404)
     u=_member_session()
     is_public=str(m.get('status','')).upper() in PUBLIC_MEMBER_STATUSES
     is_owner=bool(u and u.get('memberId')==m.get('id'))
     if not is_public and not is_owner: return Response('Not found',404)
     try:
+        mime=str(m.get('photoMimeType') or 'image/jpeg')
+        if mime not in {'image/png','image/jpeg','image/webp'}: mime='image/jpeg'
+        if str(m.get('photoStorage','')).lower()=='mongo':
+            rec=db.member_profile_photos.find_one({'memberId':m.get('id')},{'data':1,'mimeType':1})
+            if not rec or not rec.get('data'): return Response('Not found',404)
+            mime=str(rec.get('mimeType') or mime)
+            if mime not in {'image/png','image/jpeg','image/webp'}: mime='image/jpeg'
+            return Response(bytes(rec['data']),mimetype=mime,headers={'Cache-Control':'private, max-age=3600' if is_owner and not is_public else 'public, max-age=3600'})
+        if not m.get('photoDriveId'): return Response('Not found',404)
         data=drive_download_bytes_by_id(m['photoDriveId']); meta=drive_metadata(m['photoDriveId'])[2]
-        mime=str(m.get('photoMimeType') or meta.get('mimeType') or 'image/jpeg')
+        mime=str(m.get('photoMimeType') or meta.get('mimeType') or mime)
         if mime not in {'image/png','image/jpeg','image/webp'}: mime='image/jpeg'
         return Response(data,mimetype=mime,headers={'Cache-Control':'private, max-age=3600' if is_owner and not is_public else 'public, max-age=3600'})
-    except Exception: return Response('Not found',404)
+    except Exception:
+        app.logger.exception('Member profile photo retrieval failed member=%s',member_id)
+        return Response('Not found',404)
 
 @app.post('/api/membership/change-plan')
 @login_required
