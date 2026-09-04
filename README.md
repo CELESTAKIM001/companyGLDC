@@ -105,3 +105,10 @@ The Vercel serverless entry point is `api/index.py`. MongoDB initialization is l
 ## Hosted Vercel environment compatibility
 
 Use `.env.hosted.example` as the Python-compatible template for the existing hosted configuration. `VERCEL_HOSTED_ENV_MAPPING.md` documents aliases from the previous Node environment naming scheme. Do not commit production secrets.
+
+
+## V19 Membership communications and payment recovery
+- Admin can email a selected member with a clear action request, requested fields and deadline.
+- Failed/unconfirmed M-Pesa payments can be submitted by the member using the M-Pesa transaction code, amount, phone and payment date; the payment remains pending until an administrator verifies it.
+- Verified payment is required before membership approval.
+- Unfinished applications without a successful or under-review payment can be removed through a secure restart link so the member can recreate the application.

@@ -1299,9 +1299,9 @@ def member_portal_api():
     plans=[clean_doc(x) for x in db.membership_plans.find({'status':'ACTIVE'}).sort('sortOrder',ASCENDING)]
     certificates=[clean_doc(x) for x in db.membership_certificates.find({'memberId':member_id}).sort('issuedAt',DESCENDING).limit(100)]
     renewals=[clean_doc(x) for x in db.membership_renewals.find({'memberId':member_id}).sort('createdAt',DESCENDING).limit(100)]
-    state=membership_state(m); window=renewal_window_days()
+    state=membership_state(m); window=renewal_window_days(); latest_payment=payments[0] if payments else None
     pending=any(str(x.get('status','')).upper() in {'PENDING_PAYMENT','PENDING_REVIEW'} for x in renewals)
-    return jsonify(ok=True,member=_member_public(m)|{'status':state,'bio':m.get('bio',''),'profession':m.get('profession',''),'company':m.get('company',''),'location':m.get('location',''),'locationLat':m.get('locationLat'),'locationLng':m.get('locationLng'),'portfolioUrl':m.get('portfolioUrl',''),'certificateNumber':m.get('certificateNumber'),'certificateDriveId':m.get('certificateDriveId'),'renewalAvailable':state in {'EXPIRING_SOON','EXPIRED'} and not pending,'renewalWindowDays':window},documents=docs,payments=payments,leads=leads,notifications=notifications,plans=plans,certificates=certificates,renewals=renewals)
+    return jsonify(ok=True,member=_member_public(m)|{'status':state,'bio':m.get('bio',''),'profession':m.get('profession',''),'company':m.get('company',''),'location':m.get('location',''),'locationLat':m.get('locationLat'),'locationLng':m.get('locationLng'),'portfolioUrl':m.get('portfolioUrl',''),'certificateNumber':m.get('certificateNumber'),'certificateDriveId':m.get('certificateDriveId'),'adminMessage':m.get('adminMessage',''),'requestedFields':m.get('requestedFields',[]),'changeDeadline':m.get('changeDeadline'),'recreateUrl':f'{APP_URL}/membership/recreate/{m.get("recreateToken","")}' if m.get('recreateToken') else None,'latestPaymentStatus':latest_payment.get('status') if latest_payment else None,'latestPaymentId':latest_payment.get('id') if latest_payment else None,'latestMpesaReceiptNumber':latest_payment.get('mpesaReceiptNumber') if latest_payment else None,'renewalAvailable':state in {'EXPIRING_SOON','EXPIRED'} and not pending,'renewalWindowDays':window},documents=docs,payments=payments,leads=leads,notifications=notifications,plans=plans,certificates=certificates,renewals=renewals)
 
 @app.get('/membership/certificate/<certificate_no>')
 def membership_certificate_verify_page(certificate_no):
@@ -1377,9 +1377,11 @@ def membership_register_v14():
                 if not resume_token:
                     resume_token=secrets.token_urlsafe(32)
                     db.members.update_one({'_id':existing['_id']},{'$set':{'resumeToken':resume_token,'updatedAt':now()}})
+                if not existing.get('recreateToken'):
+                    existing['recreateToken']=secrets.token_urlsafe(32); db.members.update_one({'_id':existing['_id']},{'$set':{'recreateToken':existing['recreateToken'],'updatedAt':now()}})
                 return jsonify(ok=False,resume=True,memberId=existing.get('id'),resumeToken=resume_token,status=status,error={'code':'REGISTRATION_IN_PROGRESS','message':'A registration for this email has already started. Use Continue where you left off.'}),409
             return json_error('A membership account already exists for this email. Please use Member Login.',409,'MEMBER_EXISTS')
-        member={'id':make_id('MEM'),'resumeToken':secrets.token_urlsafe(32),'membershipNumber':'PENDING-'+secrets.token_hex(4).upper(),'name':name,'email':email,'phone':phone,'profileSlug':_slugify(name)+'-'+secrets.token_hex(3),'status':'EMAIL_PENDING','emailVerified':False,'createdAt':now(),'updatedAt':now(),'bio':str(b.get('bio','')).strip(),'profession':str(b.get('profession','')).strip(),'company':str(b.get('company','')).strip(),'location':str(b.get('location','')).strip(),'locationLat':float(b['locationLat']) if str(b.get('locationLat','')).strip() else None,'locationLng':float(b['locationLng']) if str(b.get('locationLng','')).strip() else None,'portfolioUrl':str(b.get('portfolioUrl','')).strip()}
+        member={'id':make_id('MEM'),'resumeToken':secrets.token_urlsafe(32),'recreateToken':secrets.token_urlsafe(32),'membershipNumber':'PENDING-'+secrets.token_hex(4).upper(),'name':name,'email':email,'phone':phone,'profileSlug':_slugify(name)+'-'+secrets.token_hex(3),'status':'EMAIL_PENDING','emailVerified':False,'createdAt':now(),'updatedAt':now(),'bio':str(b.get('bio','')).strip(),'profession':str(b.get('profession','')).strip(),'company':str(b.get('company','')).strip(),'location':str(b.get('location','')).strip(),'locationLat':float(b['locationLat']) if str(b.get('locationLat','')).strip() else None,'locationLng':float(b['locationLng']) if str(b.get('locationLng','')).strip() else None,'portfolioUrl':str(b.get('portfolioUrl','')).strip()}
         try:
             db.members.insert_one(member)
         except DuplicateKeyError:
@@ -1387,6 +1389,8 @@ def membership_register_v14():
             if existing and not existing.get('resumeToken'):
                 existing['resumeToken']=secrets.token_urlsafe(32)
                 db.members.update_one({'_id':existing['_id']},{'$set':{'resumeToken':existing['resumeToken'],'updatedAt':now()}})
+            if existing and not existing.get('recreateToken'):
+                existing['recreateToken']=secrets.token_urlsafe(32); db.members.update_one({'_id':existing['_id']},{'$set':{'recreateToken':existing['recreateToken'],'updatedAt':now()}})
             return jsonify(ok=False,resume=True,memberId=existing.get('id') if existing else None,resumeToken=existing.get('resumeToken') if existing else None,error={'code':'REGISTRATION_IN_PROGRESS','message':'A registration for this email already exists. Use Continue where you left off.'}),409
         try:
             request_otp(email)
@@ -1545,7 +1549,120 @@ def membership_subscribe():
         db.payments.update_one({'id':pid},{'$set':{'status':'FAILED','updatedAt':now(),'error':str(e)}})
         if renewal_id: db.membership_renewals.update_one({'id':renewal_id},{'$set':{'status':'PAYMENT_FAILED','updatedAt':now()}})
         db.members.update_one({'_id':m['_id']},{'$set':{'status':'PAYMENT_FAILED' if not is_renewal else state,'updatedAt':now()}})
-        return json_error('Unable to start membership payment.',502,'PAYMENT_FAILED')
+        try:
+            _send_member_email('membership_payment_failed',m,{'name':m.get('name',''),'plan':plan.get('name',''),'message':'The M-Pesa payment prompt could not be completed. If money was deducted, do not pay again. Submit the M-Pesa transaction code from your M-Pesa message for GLDC verification.','resumeUrl':f'{APP_URL}/member/dashboard','recreateUrl':f'{APP_URL}/membership/recreate/{m.get("recreateToken","")}'})
+        except Exception: app.logger.exception('Payment failure email failed')
+        return json_error('We could not start the M-Pesa payment. If money was deducted, do not pay again—submit your M-Pesa transaction code for GLDC verification.',502,'PAYMENT_FAILED')
+
+@app.post('/api/membership/submit-payment-reference')
+@login_required
+def membership_submit_payment_reference():
+    try:
+        m=_member_doc()
+        if not m: return json_error('Member application not found.',404,'MEMBER_NOT_FOUND')
+        b=request.get_json(silent=True) or {}
+        code=re.sub(r'[^A-Za-z0-9]','',str(b.get('mpesaCode','')).upper())
+        if not re.fullmatch(r'[A-Z0-9]{8,20}',code): return json_error('Enter the M-Pesa transaction code exactly as shown on your M-Pesa message.',422,'MPESA_CODE_INVALID')
+        try: amount=float(b.get('amount',0) or 0)
+        except Exception: amount=0
+        if amount<=0: return json_error('Enter the amount you paid.',422,'AMOUNT_INVALID')
+        try: phone=normalize_mpesa_phone(str(b.get('phone','')).strip() or m.get('phone',''))
+        except RuntimeError: return json_error('Please enter a valid Kenyan M-Pesa number.',422,'PHONE_INVALID')
+        payment_date=str(b.get('paymentDate','')).strip()
+        latest=db.payments.find_one({'memberId':m['id']},sort=[('createdAt',DESCENDING)])
+        if not latest: return json_error('No membership payment attempt was found. Please select your membership plan first.',409,'PAYMENT_NOT_FOUND')
+        if str(latest.get('status','')).upper()=='SUCCESSFUL': return json_error('Your payment is already recorded. Please wait for GLDC validation.',409,'PAYMENT_ALREADY_RECORDED')
+        plan=db.membership_plans.find_one({'id':latest.get('planId')})
+        if plan and abs(float(plan.get('price',0))-amount)>0.01: return json_error(f'The amount does not match the selected plan ({CURRENCY} {float(plan.get("price",0)):,.2f}). Please check your M-Pesa message.',422,'AMOUNT_MISMATCH')
+        duplicate=db.payments.find_one({'mpesaReceiptNumber':code})
+        if duplicate and duplicate.get('memberId')!=m.get('id'): return json_error('That M-Pesa transaction code has already been submitted for another application.',409,'MPESA_CODE_USED')
+        update={'status':'PENDING_ADMIN_VERIFICATION','mpesaReceiptNumber':code,'reference':code,'manualPaymentCode':code,'manualAmount':amount,'phoneNumber':phone,'manualPaymentDate':payment_date or None,'manualSubmittedAt':now(),'updatedAt':now(),'verificationNote':'Member submitted M-Pesa receipt for admin verification.'}
+        db.payments.update_one({'_id':latest['_id']},{'$set':update})
+        db.members.update_one({'_id':m['_id']},{'$set':{'status':'PENDING_REVIEW','paymentId':latest.get('id'),'paymentReceiptCode':latest.get('receiptCode'),'updatedAt':now()}})
+        audit('MEMBERSHIP_MANUAL_PAYMENT_SUBMITTED','member',m['id'],{'paymentId':latest.get('id'),'mpesaCode':code})
+        try: db.notifications.insert_one({'id':make_id('NOT'),'memberId':m['id'],'title':'Payment submitted for GLDC verification','message':'Your M-Pesa receipt has been submitted. GLDC will verify the transaction before approving your membership.','type':'MEMBERSHIP','audience':'MEMBER','createdAt':now()})
+        except Exception: pass
+        return jsonify(ok=True,status='PENDING_REVIEW',message='Payment details received. GLDC will verify the M-Pesa transaction and review your membership application.')
+    except Exception:
+        app.logger.exception('Manual membership payment submission failed request=%s',getattr(request,'request_id','unknown'))
+        return json_error('We could not submit your payment details right now. Please try again.',503,'PAYMENT_REFERENCE_UNAVAILABLE')
+
+@app.get('/membership/recreate/<token>')
+def membership_recreate_page(token):
+    m=db.members.find_one({'recreateToken':token}) if db is not None else None
+    if not m: return render_template('404.html',title='Link expired'),404
+    allowed={'EMAIL_PENDING','PENDING_PAYMENT','PAYMENT_FAILED','PAYMENT_PENDING','CHANGES_REQUIRED','REJECTED'}
+    if str(m.get('status','')).upper() not in allowed: return render_template('membership_recreate.html',title='Cannot restart membership',allowed=False,message='This membership application can no longer be removed because payment or membership processing has progressed.'),409
+    paid=db.payments.find_one({'memberId':m.get('id'),'status':{'$in':['SUCCESSFUL','PENDING_ADMIN_VERIFICATION']}})
+    if paid: return render_template('membership_recreate.html',title='Cannot restart membership',allowed=False,message='This application has a payment record under review. Please wait for GLDC validation instead of creating another application.'),409
+    return render_template('membership_recreate.html',title='Restart membership application',allowed=True,member=clean_doc(m),token=token)
+
+@app.post('/api/membership/recreate/<token>')
+def membership_recreate(token):
+    try:
+        m=db.members.find_one({'recreateToken':token}) if db is not None else None
+        if not m: return json_error('This restart link is invalid or has expired.',404,'RECREATE_NOT_FOUND')
+        allowed={'EMAIL_PENDING','PENDING_PAYMENT','PAYMENT_FAILED','PAYMENT_PENDING','CHANGES_REQUIRED','REJECTED'}
+        if str(m.get('status','')).upper() not in allowed: return json_error('This application cannot be removed because membership processing has progressed.',409,'RECREATE_BLOCKED')
+        paid=db.payments.find_one({'memberId':m.get('id'),'status':{'$in':['SUCCESSFUL','PENDING_ADMIN_VERIFICATION']}})
+        if paid: return json_error('A payment is already under review. Please wait for GLDC validation.',409,'PAYMENT_UNDER_REVIEW')
+        db.otps.delete_many({'email':m.get('email')}); db.membership_renewals.delete_many({'memberId':m.get('id')}); db.payments.delete_many({'memberId':m.get('id')}); db.member_documents.delete_many({'memberId':m.get('id')}); db.notifications.delete_many({'memberId':m.get('id')}); db.members.delete_one({'_id':m['_id']}); session.pop('user',None)
+        audit('MEMBERSHIP_APPLICATION_REMOVED','member',m.get('id'),{'email':m.get('email')})
+        return jsonify(ok=True,message='Your unfinished membership application has been removed. You can now create a new membership application.')
+    except Exception:
+        app.logger.exception('Membership recreate failed')
+        return json_error('We could not remove the unfinished application right now. Please try again.',503,'RECREATE_FAILED')
+
+@app.post('/api/admin/membership/request-action')
+@admin_required
+def admin_membership_request_action():
+    try:
+        b=request.get_json(silent=True) or {}; member_id=str(b.get('memberId','')).strip(); message=str(b.get('message','')).strip(); deadline=str(b.get('deadline','')).strip(); fields=b.get('fields') or []
+        if not member_id or not message: return json_error('Select a member and explain what they need to complete.',422,'VALIDATION_ERROR')
+        m=db.members.find_one({'id':member_id})
+        if not m: return json_error('Member application not found.',404,'MEMBER_NOT_FOUND')
+        edit_url=f'{APP_URL}/member/dashboard?edit=1'
+        field_text=', '.join(str(x).replace('_',' ').title() for x in fields) or 'the details requested in this message'
+        due=f'<p><b>Requested fields:</b> {field_text}</p>' if fields else ''
+        if deadline: due += f'<p><b>Please complete by:</b> {deadline}</p>'
+        current_status=str(m.get('status','')).upper(); new_status=current_status if current_status in {'ACTIVE','EXPIRING_SOON','EXPIRED'} else 'CHANGES_REQUIRED'; db.members.update_one({'_id':m['_id']},{'$set':{'status':new_status,'actionRequired':True,'adminMessage':message,'requestedFields':fields,'changeDeadline':deadline or None,'updatedAt':now()}})
+        db.notifications.insert_one({'id':make_id('NOT'),'memberId':m['id'],'title':'GLDC action required','message':message,'type':'MEMBERSHIP','audience':'MEMBER','createdAt':now()})
+        variables={'name':m.get('name',''),'message':message,'editUrl':edit_url,'requestedFields':field_text,'deadline':deadline or 'As soon as possible','subject':'GLDC Membership – action required','text':f'Dear {m.get("name","")},\n\n{message}\n\nRequested fields: {field_text}\nDeadline: {deadline or "As soon as possible"}\n\nUpdate your details here: {edit_url}'}
+        rendered=email_template_render('membership_action_request',variables)
+        if rendered: send_email(m['email'],rendered[0],rendered[1],rendered[2])
+        else: send_email(m['email'],variables['subject'],variables['text'],f'<div style="font-family:Arial;max-width:640px;margin:auto"><h2 style="color:#8B4A18">GLDC Membership – action required</h2><p>Dear <b>{m.get("name","")}</b>,</p><p>{message}</p>{due}<p><a href="{edit_url}" style="background:#8B4A18;color:#fff;padding:12px 18px;text-decoration:none">OPEN MEMBER PORTAL</a></p></div>')
+        audit('MEMBERSHIP_ACTION_REQUESTED','member',member_id,{'fields':fields,'deadline':deadline})
+        return jsonify(ok=True,message='Member action request emailed successfully.')
+    except Exception as e:
+        app.logger.exception('Membership action email failed')
+        if 'SMTP' in str(e).upper(): return json_error('The member details were saved, but the email could not be sent because email delivery is not configured or available.',503,'EMAIL_SEND_FAILED')
+        return json_error('We could not send the member action request right now.',503,'MEMBER_ACTION_EMAIL_FAILED')
+
+@app.post('/api/admin/membership/payments/<payment_id>/verify')
+@admin_required
+def admin_verify_membership_payment(payment_id):
+    b=request.get_json(silent=True) or {}; decision=str(b.get('decision','VERIFY')).upper(); p=db.payments.find_one({'id':payment_id})
+    if not p: return json_error('Payment not found.',404,'PAYMENT_NOT_FOUND')
+    if decision not in {'VERIFY','REJECT'}: return json_error('Invalid payment decision.',422,'VALIDATION_ERROR')
+    m=db.members.find_one({'id':p.get('memberId')})
+    if not m: return json_error('Member application not found.',404,'MEMBER_NOT_FOUND')
+    if decision=='VERIFY':
+        code=str(p.get('mpesaReceiptNumber') or p.get('manualPaymentCode') or '').strip().upper()
+        if not code: return json_error('No M-Pesa receipt code has been submitted.',409,'MPESA_CODE_MISSING')
+        db.payments.update_one({'_id':p['_id']},{'$set':{'status':'SUCCESSFUL','verifiedManually':True,'verifiedAt':now(),'verifiedBy':current_user().get('email'),'resultDescription':'Verified by GLDC administrator.','updatedAt':now(),'mpesaReceiptNumber':code}})
+        db.members.update_one({'_id':m['_id']},{'$set':{'status':'PENDING_REVIEW','paymentId':p['id'],'paymentReceiptCode':p.get('receiptCode'),'updatedAt':now()}})
+        db.notifications.insert_one({'id':make_id('NOT'),'memberId':m['id'],'title':'Payment verified by GLDC','message':'Your M-Pesa payment has been verified. Your membership application is now awaiting final GLDC approval.','type':'MEMBERSHIP','audience':'MEMBER','createdAt':now()})
+        try: _send_member_email('membership_payment_verified',m,{'name':m.get('name',''),'plan':p.get('planName',''),'amount':p.get('amount'),'mpesaCode':code,'editUrl':f'{APP_URL}/member/dashboard'})
+        except Exception: app.logger.exception('Payment verified email failed')
+        audit('MEMBERSHIP_PAYMENT_VERIFIED','payment',payment_id,{'memberId':m['id'],'mpesaCode':code})
+        return jsonify(ok=True,status='SUCCESSFUL',message='Payment verified. The membership application is now ready for final approval.')
+    note=str(b.get('message','The M-Pesa receipt could not be verified. Please check the transaction details and submit the correct code.')).strip()
+    db.payments.update_one({'_id':p['_id']},{'$set':{'status':'FAILED','verificationRejected':True,'verificationMessage':note,'verifiedAt':now(),'verifiedBy':current_user().get('email'),'updatedAt':now()}})
+    db.members.update_one({'_id':m['_id']},{'$set':{'status':'PAYMENT_FAILED','adminMessage':note,'updatedAt':now()}})
+    try: _send_member_email('membership_payment_failed',m,{'name':m.get('name',''),'message':note,'resumeUrl':f'{APP_URL}/member/dashboard','recreateUrl':f'{APP_URL}/membership/recreate/{m.get("recreateToken","")}'})
+    except Exception: app.logger.exception('Payment rejection email failed')
+    audit('MEMBERSHIP_PAYMENT_REJECTED','payment',payment_id,{'memberId':m['id']})
+    return jsonify(ok=True,status='FAILED',message='Payment marked as unverified and the member has been notified.')
 
 @app.get('/api/admin/membership/plans')
 @admin_required
@@ -1568,7 +1685,19 @@ def admin_membership_plan_update(plan_id):
 @admin_required
 def admin_members_v14():
     xs=list(db.members.find({}).sort('createdAt',DESCENDING).limit(500)); out=[]
-    for x in xs: out.append(clean_doc(sync_membership_state(x)))
+    for x in xs:
+        x=sync_membership_state(x)
+        latest=db.payments.find_one({'memberId':x.get('id')},sort=[('createdAt',DESCENDING)])
+        if latest:
+            x['latestPaymentStatus']=latest.get('status')
+            x['latestPaymentId']=latest.get('id')
+            x['latestMpesaReceiptNumber']=latest.get('mpesaReceiptNumber')
+            x['latestPaymentAmount']=latest.get('amount')
+            x['latestPaymentReference']=latest.get('reference')
+            x['latestPaymentPhone']=latest.get('phoneNumber') or latest.get('phone')
+            x['latestPaymentDate']=latest.get('manualPaymentDate') or latest.get('transactionDate')
+            x['paymentReceiptCode']=latest.get('receiptCode') or x.get('paymentReceiptCode')
+        out.append(clean_doc(x))
     return jsonify(ok=True,members=out)
 
 @app.post('/api/admin/members/<member_id>/decision')
@@ -1578,6 +1707,9 @@ def admin_member_decision(member_id):
     if not m: return json_error('Member not found.',404,'MEMBER_NOT_FOUND')
     if decision not in {'APPROVE','REQUEST_CHANGES','REJECT'}: return json_error('Invalid decision.',422,'VALIDATION_ERROR')
     if decision=='APPROVE':
+        payment=db.payments.find_one({'id':m.get('paymentId')}) if m.get('paymentId') else None
+        if not payment or str(payment.get('status','')).upper()!='SUCCESSFUL':
+            return json_error('Payment must be successfully verified before membership approval.',409,'PAYMENT_NOT_VERIFIED')
         plan=_membership_plan(m.get('membershipPlanId','')) or db.membership_plans.find_one({'name':m.get('membershipPlan')})
         if not plan: return json_error('Membership plan not found.',409,'PLAN_NOT_FOUND')
         old_certificate_number=m.get('certificateNumber')
@@ -2021,6 +2153,8 @@ def init_database():
     db.membership_certificates.create_index([('memberId',ASCENDING),('issuedAt',DESCENDING)])
     db.membership_renewals.create_index([('memberId',ASCENDING),('createdAt',DESCENDING)])
     db.membership_renewals.create_index([('paymentId',ASCENDING)], unique=True, sparse=True)
+    db.members.create_index([('recreateToken',ASCENDING)], unique=True, sparse=True)
+    db.payments.create_index([('mpesaReceiptNumber',ASCENDING)], unique=True, sparse=True)
     db.member_documents.create_index([('memberId',ASCENDING),('category',ASCENDING),('createdAt',DESCENDING)])
     db.email_templates.create_index([('name',ASCENDING)], unique=True)
     db.media.create_index([('slot',ASCENDING)], unique=True)
@@ -2033,6 +2167,9 @@ def init_database():
     email_defaults={
       'membership_payment_receipt':{'subject':'GLDC Membership Payment Receipt – {{receiptCode}}','text':'Dear {{name}}, your payment of KES {{amount}} has been received. Receipt {{receiptCode}}.','html':'<div style=\"font-family:Arial;max-width:640px;margin:auto\"><div style=\"padding:24px;background:#8B4A18;color:#fff\"><h2>GLDC Membership</h2></div><div style=\"padding:24px\"><p>Dear <b>{{name}}</b>,</p><p>We have received your payment for <b>{{plan}}</b>.</p><p><b>Amount:</b> KES {{amount}}<br><b>Receipt:</b> {{receiptCode}}</p><p>Your application is now awaiting membership review. The receipt PDF is attached.</p></div></div>'},
       'membership_changes':{'subject':'GLDC Membership – action required','text':'Dear {{name}}, {{message}} Please use {{editUrl}} to update your details.','html':'<div style=\"font-family:Arial;max-width:640px;margin:auto\"><h2 style=\"color:#8B4A18\">Membership details need your attention</h2><p>Dear {{name}},</p><p>{{message}}</p><p><a href=\"{{editUrl}}\" style=\"background:#8B4A18;color:#fff;padding:12px 18px;text-decoration:none\">EDIT MY DETAILS</a></p></div>'},
+      'membership_action_request':{'subject':'GLDC Membership – action required','text':'Dear {{name}}, {{message}} Requested fields: {{requestedFields}}. Deadline: {{deadline}}. Update your details: {{editUrl}}','html':'<div style="font-family:Arial;max-width:640px;margin:auto"><div style="padding:22px;background:#8B4A18;color:#fff"><h2>GLDC Membership – action required</h2></div><div style="padding:24px"><p>Dear <b>{{name}}</b>,</p><p>{{message}}</p><p><b>Requested fields:</b> {{requestedFields}}<br><b>Deadline:</b> {{deadline}}</p><p><a href="{{editUrl}}" style="background:#8B4A18;color:#fff;padding:12px 18px;text-decoration:none">OPEN MEMBER PORTAL</a></p></div></div>'},
+      'membership_payment_failed':{'subject':'GLDC Membership – payment needs attention','text':'Dear {{name}}, your membership payment could not be completed. {{message}} Continue: {{resumeUrl}}. If you already paid, submit the M-Pesa code for GLDC verification.','html':'<div style=\"font-family:Arial;max-width:640px;margin:auto\"><div style=\"padding:22px;background:#8B4A18;color:#fff\"><h2>GLDC Membership Payment</h2></div><div style=\"padding:24px\"><p>Dear <b>{{name}}</b>,</p><p>{{message}}</p><p><b>If you already paid:</b> do not pay again. Open your Member Portal and submit the M-Pesa transaction code shown in your M-Pesa message. GLDC will verify the transaction before approving your membership.</p><p><a href=\"{{resumeUrl}}\" style=\"background:#8B4A18;color:#fff;padding:12px 18px;text-decoration:none\">CONTINUE MY APPLICATION</a></p><p>If you need to remove an unfinished application and start again, <a href=\"{{recreateUrl}}\">use the secure restart link</a>. This option is unavailable after a payment is under review.</p></div></div>'},
+      'membership_payment_verified':{'subject':'GLDC Membership – payment verified','text':'Dear {{name}}, your M-Pesa payment {{mpesaCode}} has been verified by GLDC. Your application is now awaiting final approval.','html':'<div style=\"font-family:Arial;max-width:640px;margin:auto\"><h2 style=\"color:#8B4A18\">Payment verified ✓</h2><p>Dear <b>{{name}}</b>,</p><p>Your M-Pesa payment <b>{{mpesaCode}}</b> for <b>{{plan}}</b> has been verified by GLDC.</p><p>Your application is now awaiting final membership approval. Please do not make another payment.</p><p><a href=\"{{APP_URL}}/member/dashboard\">OPEN MEMBER PORTAL</a></p></div>'},
       'membership_certificate':{'subject':'Your GLDC Membership Certificate – {{certificateNumber}}','text':'Congratulations {{name}}. Your GLDC membership certificate is attached.','html':'<div style=\"font-family:Arial;max-width:640px;margin:auto\"><div style=\"padding:24px;background:#8B4A18;color:#fff\"><h2>Membership Approved</h2></div><div style=\"padding:24px\"><p>Dear <b>{{name}}</b>,</p><p>Your GLDC membership has been approved. Your certificate is attached.</p><p><b>Plan:</b> {{plan}}<br><b>Membership No:</b> {{membershipNumber}}<br><b>Valid until:</b> {{validUntil}}</p></div></div>'}
     }
     for name,t in email_defaults.items(): db.email_templates.update_one({'name':name},{'$setOnInsert':{'name':name,'createdAt':now()},'$set':t},upsert=True)

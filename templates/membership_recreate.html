@@ -1,0 +1,25 @@
+{% extends 'base.html' %}
+{% block content %}
+<section class="section"><div class="container" style="max-width:760px">
+  <div class="card" style="padding:36px">
+    <span class="eyebrow">GLDC MEMBERSHIP</span>
+    <h1>{{ title }}</h1>
+    {% if allowed %}
+      <p>You are about to remove the unfinished membership application for <b>{{ member.name }}</b> ({{ member.email }}).</p>
+      <div class="notice" style="margin:20px 0"><b>Please note:</b> This removes only the unfinished application and its pending payment attempts. It does not remove an approved GLDC membership.</div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap"><button class="btn primary" id="removeBtn">REMOVE APPLICATION & START AGAIN</button><a class="btn secondary" href="/member/dashboard">KEEP MY APPLICATION</a></div>
+      <div id="msg" style="margin-top:15px"></div>
+    {% else %}
+      <div class="notice">{{ message }}</div>
+      <p style="margin-top:18px"><a class="btn primary" href="/member/dashboard">OPEN MEMBER PORTAL</a></p>
+    {% endif %}
+  </div>
+</div></section>
+{% endblock %}
+{% block scripts %}
+<script>
+const csrf=document.querySelector('meta[name=csrf-token]')?.content||'';
+const btn=document.getElementById('removeBtn');
+btn?.addEventListener('click',async()=>{if(!confirm('Remove this unfinished membership application? You can then register again with the same email.'))return;btn.disabled=true;try{const r=await fetch('/api/membership/recreate/{{ token }}',{method:'POST',headers:{'X-CSRF-Token':csrf}});const t=await r.text();let j={};try{j=JSON.parse(t)}catch(_){j={ok:false,error:{message:t}}}if(!r.ok||!j.ok)throw Error(j.error?.message||'Unable to remove the application.');location.href='/member?recreated=1'}catch(e){document.getElementById('msg').innerHTML='<div class="notice">'+String(e.message).replace(/[&<>]/g,x=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[x]))+'</div>';btn.disabled=false}});
+</script>
+{% endblock %}
