@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 from functools import wraps
 from email.message import EmailMessage
 from io import BytesIO
+from pathlib import Path
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.pdfgen import canvas
