@@ -36,7 +36,7 @@ python -c "from app import app; print('startup validation OK')"
 gunicorn --config gunicorn.conf.py wsgi:application
 ```
 
-Open `http://127.0.0.1:5000`.
+Open `https://companygldc.vercel.app`.
 
 ## 3. Docker deployment
 
