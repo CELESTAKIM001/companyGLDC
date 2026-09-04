@@ -257,13 +257,19 @@ def build_invoice_pdf(invoice):
 
 def build_receipt_pdf(payment, membership=None):
     buf=BytesIO(); c=canvas.Canvas(buf,pagesize=A4); w,h=A4; company=_company_profile()
-    c.setTitle(payment.get('receiptCode') or payment.get('id','Receipt'))
+    code=payment.get('receiptCode') or payment.get('mpesaReceiptNumber') or payment.get('id','Receipt')
+    verify_url=payment.get('verificationUrl') or f"{APP_URL}/receipt/{code}"
+    c.setTitle(code)
     c.setFont('Helvetica-Bold',20); c.drawString(22*mm,h-28*mm,company['name']); c.setFont('Helvetica-Bold',16); c.drawRightString(w-22*mm,h-28*mm,'PAYMENT RECEIPT')
     c.setFont('Helvetica',9); c.drawString(22*mm,h-35*mm,company['tagline']); c.line(22*mm,h-41*mm,w-22*mm,h-41*mm)
-    y=h-60*mm; rows=[('Receipt code',payment.get('receiptCode') or payment.get('mpesaReceiptNumber') or payment.get('id')),('Member', (membership or {}).get('name') or payment.get('memberName','')),('Email',(membership or {}).get('email') or payment.get('email','')),('Plan',payment.get('planName','')),('Amount',f"KES {float(payment.get('amount',0)):,.2f}"),('Method',payment.get('method','M-PESA')),('Transaction',payment.get('mpesaReceiptNumber') or payment.get('reference') or ''),('Date',str(payment.get('createdAt',''))[:19].replace('T',' '))]
+    y=h-60*mm; rows=[('Receipt code',code),('Member',(membership or {}).get('name') or payment.get('memberName','')),('Email',(membership or {}).get('email') or payment.get('email','')),('Plan',payment.get('planName','')),('Amount',f"KES {float(payment.get('amount',0)):,.2f}"),('Method',payment.get('method','M-PESA')),('Transaction',payment.get('mpesaReceiptNumber') or payment.get('reference') or ''),('Date',str(payment.get('createdAt',''))[:19].replace('T',' ')),('Status',payment.get('status','RECORDED'))]
     for k,v in rows:
-        c.setFont('Helvetica-Bold',9); c.drawString(22*mm,y,k.upper()); c.setFont('Helvetica',10); c.drawString(65*mm,y,str(v)[:90]); y-=11*mm
-    c.setFont('Helvetica',9); c.drawString(22*mm,35*mm,'This receipt confirms payment was recorded. Membership remains subject to GLDC review and approval.')
+        c.setFont('Helvetica-Bold',9); c.drawString(22*mm,y,k.upper()); c.setFont('Helvetica',10); c.drawString(65*mm,y,str(v)[:90]); y-=10*mm
+    _draw_qr(c,verify_url,w-58*mm,25*mm,32*mm)
+    c.setFont('Helvetica-Bold',8); c.drawString(w-105*mm,49*mm,'SCAN TO VERIFY RECEIPT')
+    c.setFont('Helvetica',7.5); c.drawString(w-105*mm,44*mm,'The QR code opens the official GLDC')
+    c.drawString(w-105*mm,40*mm,'verification page for this receipt.')
+    c.setFont('Helvetica',8.5); c.drawString(22*mm,35*mm,'This receipt confirms that the payment record was issued by GLDC. Membership approval remains subject to GLDC review where applicable.')
     c.save(); return buf.getvalue()
 
 def build_membership_certificate(member, plan, certificate_no, valid_from=None, valid_until=None, issue_date=None):
@@ -2203,6 +2209,70 @@ def admin_location_create():
 @admin_required
 def admin_location_update(location_id):
     b=request.get_json(silent=True) or {}; allowed=['name','address','description','phone','email','hours','lat','lng','zoom','primary','status']; u={k:b[k] for k in allowed if k in b}; u['updatedAt']=now(); db.office_locations.update_one({'id':location_id},{'$set':u}); audit('OFFICE_LOCATION_UPDATED','office',location_id,u); return jsonify(ok=True)
+
+@app.get('/receipt/<receipt_code>')
+def receipt_verify_page(receipt_code):
+    p=db.payments.find_one({'receiptCode':receipt_code},{'_id':0}) if db is not None else None
+    if not p: return render_template('404.html',title='Receipt not found'),404
+    m=db.members.find_one({'id':p.get('memberId')},{'_id':0,'name':1,'email':1,'membershipNumber':1,'membershipPlan':1}) if db is not None and p.get('memberId') else None
+    safe={'receiptCode':p.get('receiptCode'),'memberName':(m or {}).get('name') or p.get('memberName',''),'membershipNumber':(m or {}).get('membershipNumber',''),'planName':p.get('planName',''),'amount':float(p.get('amount',0) or 0),'currency':p.get('currency',CURRENCY),'method':p.get('method',''),'reference':p.get('mpesaReceiptNumber') or p.get('reference',''),'status':p.get('status',''),'createdAt':str(p.get('createdAt','')),'verifiedAt':str(p.get('verifiedAt','')) if p.get('verifiedAt') else None}
+    return render_template('receipt_verify.html',title='Receipt Verification',receipt=safe)
+
+@app.get('/api/receipt/<receipt_code>')
+def receipt_verify_api(receipt_code):
+    p=db.payments.find_one({'receiptCode':receipt_code},{'_id':0}) if db is not None else None
+    if not p: return json_error('Receipt not found.',404,'RECEIPT_NOT_FOUND')
+    m=db.members.find_one({'id':p.get('memberId')},{'_id':0,'name':1,'membershipNumber':1,'membershipPlan':1}) if db is not None and p.get('memberId') else None
+    return jsonify(ok=True,receipt={'receiptCode':p.get('receiptCode'),'memberName':(m or {}).get('name') or p.get('memberName',''),'membershipNumber':(m or {}).get('membershipNumber',''),'planName':p.get('planName',''),'amount':float(p.get('amount',0) or 0),'currency':p.get('currency',CURRENCY),'method':p.get('method',''),'reference':p.get('mpesaReceiptNumber') or p.get('reference',''),'status':p.get('status',''),'createdAt':str(p.get('createdAt','')),'verifiedAt':str(p.get('verifiedAt')) if p.get('verifiedAt') else None})
+
+@app.get('/api/admin/membership/receipts/<receipt_code>/download')
+@admin_required
+def admin_receipt_download(receipt_code):
+    p=db.payments.find_one({'receiptCode':receipt_code})
+    if not p: return json_error('Receipt not found.',404,'RECEIPT_NOT_FOUND')
+    m=db.members.find_one({'id':p.get('memberId')}) if p.get('memberId') else None
+    p['verificationUrl']=f'{APP_URL}/receipt/{receipt_code}'
+    data=build_receipt_pdf(p,m)
+    r=Response(data,mimetype='application/pdf'); r.headers['Content-Disposition']=f'inline; filename="{receipt_code}.pdf"'; r.headers['Content-Length']=str(len(data)); r.headers['Cache-Control']='private, no-store'; return r
+
+@app.post('/api/admin/membership/receipts')
+@admin_required
+def admin_create_membership_receipt():
+    try:
+        b=request.get_json(silent=True) or {}; member_id=str(b.get('memberId','')).strip(); amount=float(b.get('amount',0) or 0); method=str(b.get('method','CASH')).upper(); reference=str(b.get('reference','')).strip(); plan_id=str(b.get('planId','')).strip()
+        if amount<0: return json_error('Amount cannot be negative.',422,'VALIDATION_ERROR')
+        m=db.members.find_one({'id':member_id}) if member_id else None
+        if member_id and not m: return json_error('Member not found.',404,'MEMBER_NOT_FOUND')
+        plan=_membership_plan(plan_id) if plan_id else (db.membership_plans.find_one({'id':m.get('membershipPlanId')}) if m else None)
+        code='GLDC-RCP-'+datetime.now(timezone.utc).strftime('%Y%m%d')+'-'+secrets.token_hex(4).upper()
+        p={'id':make_id('PAY'),'memberId':member_id or None,'memberName':(m or {}).get('name',''),'email':(m or {}).get('email',''),'amount':round(amount,2),'currency':CURRENCY,'method':method,'reference':reference,'status':'SUCCESSFUL','source':'ADMIN_RECEIPT','receiptCode':code,'planId':(plan or {}).get('id') or None,'planName':(plan or {}).get('name') or (m or {}).get('membershipPlan',''),'createdAt':now(),'updatedAt':now(),'verifiedAt':now(),'recordedBy':current_user().get('email'),'notes':str(b.get('notes','')).strip(),'verificationUrl':f'{APP_URL}/receipt/{code}'}
+        db.payments.insert_one(p); audit('MEMBERSHIP_RECEIPT_CREATED','payment',p['id'],{'receiptCode':code,'memberId':member_id,'amount':amount,'method':method})
+        pdf=build_receipt_pdf(p,m)
+        if b.get('sendEmail',False) and m and m.get('email'):
+            send_email(m['email'],f'GLDC Payment Receipt {code}',f'Your GLDC payment receipt is {code}. Verify it at {APP_URL}/receipt/{code}.',f'<p>Your GLDC payment receipt is <b>{code}</b>.</p><p><a href="{APP_URL}/receipt/{code}">VERIFY RECEIPT</a></p>',[(code+'.pdf',pdf,'application/pdf')])
+        return jsonify(ok=True,receipt={'receiptCode':code,'verificationUrl':f'{APP_URL}/receipt/{code}','downloadUrl':f'/api/admin/membership/receipts/{code}/download'})
+    except Exception:
+        app.logger.exception('Admin receipt creation failed request=%s',request.request_id); return json_error('Unable to create receipt.',500,'RECEIPT_CREATE_FAILED')
+
+@app.post('/api/admin/membership/payments/prompt')
+@admin_required
+def admin_membership_payment_prompt():
+    try:
+        b=request.get_json(silent=True) or {}; member_id=str(b.get('memberId','')).strip(); phone=str(b.get('phone','')).strip(); plan_id=str(b.get('planId','')).strip(); amount=float(b.get('amount',0) or 0)
+        m=db.members.find_one({'id':member_id}) if member_id else None
+        if not m: return json_error('Select a valid member.',404,'MEMBER_NOT_FOUND')
+        plan=_membership_plan(plan_id) if plan_id else None
+        if plan: amount=float(plan.get('price',0) or 0)
+        if amount<=0: return json_error('Select a paid tier or enter a positive amount.',422,'VALIDATION_ERROR')
+        phone=normalize_mpesa_phone(phone or m.get('phone'))
+        pid=make_id('PAY'); code='GLDC-RCP-'+secrets.token_hex(5).upper(); name=(plan or {}).get('name') or m.get('membershipPlan','Membership Payment')
+        p={'id':pid,'memberId':m['id'],'email':m.get('email',''),'phone':phone,'amount':amount,'currency':CURRENCY,'planId':(plan or {}).get('id') or m.get('membershipPlanId'),'planName':name,'method':'M-PESA','status':'PENDING','purpose':'MEMBERSHIP_ADMIN_PROMPT','receiptCode':code,'createdAt':now(),'updatedAt':now(),'source':'ADMIN_PROMPT','promptedBy':current_user().get('email')}
+        db.payments.insert_one(p); r=daraja_stk(phone,int(round(amount)),f'GLDC-{code}',f'{name} payment'); db.payments.update_one({'id':pid},{'$set':{'merchantRequestId':r.get('MerchantRequestID'),'checkoutRequestId':r.get('CheckoutRequestID'),'responseDescription':r.get('ResponseDescription'),'updatedAt':now()}})
+        audit('MEMBERSHIP_PAYMENT_PROMPTED','payment',pid,{'memberId':m['id'],'amount':amount,'phone':phone,'planId':p.get('planId')})
+        return jsonify(ok=True,paymentId=pid,receiptCode=code,status='PENDING',message=r.get('CustomerMessage','Payment prompt sent to the member.'),member=m.get('name'),phone=phone)
+    except Exception as e:
+        app.logger.exception('Admin membership prompt failed request=%s',request.request_id)
+        return json_error(str(e),500,'MEMBERSHIP_PROMPT_FAILED')
 
 @app.get('/invoice/<invoice_number>')
 def invoice_verify_page(invoice_number):
