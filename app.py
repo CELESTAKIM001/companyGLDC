@@ -1631,7 +1631,17 @@ def membership_register_v14():
                        if existing.get('emailVerified') else
                        'A registration for this email has already started. Continue where you left off to verify your email.')
                 return jsonify(ok=False,resume=True,memberId=existing.get('id'),resumeToken=resume_token,status=status,emailVerified=bool(existing.get('emailVerified')),error={'code':'REGISTRATION_IN_PROGRESS','message':msg}),409
-            return json_error('An approved membership already exists for this email. Please use Member Login.',409,'MEMBER_EXISTS')
+            # Approved members should not be blocked at Step 1. They have already
+            # completed email verification; send them into the next safe step so
+            # they can continue from the membership workspace (including upgrade /
+            # renewal) without being forced to re-register.
+            if status in {'ACTIVE','EXPIRING_SOON','EXPIRED'}:
+                resume_token=existing.get('resumeToken') or secrets.token_urlsafe(32)
+                if not existing.get('resumeToken'):
+                    db.members.update_one({'_id':existing['_id']},{'$set':{'resumeToken':resume_token,'updatedAt':now()}})
+                return jsonify(ok=True,resume=True,memberId=existing.get('id'),resumeToken=resume_token,
+                                status=status,emailVerified=True,approved=True,stage=2,
+                                message='Your email is already verified. Continue to Step 2.')
         member={'id':make_id('MEM'),'resumeToken':secrets.token_urlsafe(32),'recreateToken':secrets.token_urlsafe(32),'membershipNumber':'PENDING-'+secrets.token_hex(4).upper(),'name':name,'email':email,'phone':phone,'profileSlug':_slugify(name)+'-'+secrets.token_hex(3),'status':'EMAIL_PENDING','emailVerified':False,'createdAt':now(),'updatedAt':now(),'bio':str(b.get('bio','')).strip(),'profession':str(b.get('profession','')).strip(),'company':str(b.get('company','')).strip(),'location':str(b.get('location','')).strip(),'locationLat':float(b['locationLat']) if str(b.get('locationLat','')).strip() else None,'locationLng':float(b['locationLng']) if str(b.get('locationLng','')).strip() else None,'portfolioUrl':str(b.get('portfolioUrl','')).strip()}
         try:
             db.members.insert_one(member)
