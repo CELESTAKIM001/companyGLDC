@@ -1483,6 +1483,43 @@ def admin_member_update(member_id):
     audit('MEMBER_ADMIN_EDITED','member',member_id,{'before':{k:(v.isoformat() if hasattr(v,'isoformat') else v) for k,v in before.items()},'after':{k:(v.isoformat() if hasattr(v,'isoformat') else v) for k,v in update.items() if k!='updatedAt'}})
     return jsonify(ok=True,member=clean_doc({**m,**update}))
 
+ADMIN_RECREATE_STATUSES={'EMAIL_PENDING','PENDING_PAYMENT','PAYMENT_FAILED','PAYMENT_PENDING','CHANGES_REQUIRED','REJECTED'}
+
+def _admin_member_has_protected_payment(member_id):
+    return db.payments.find_one({'memberId':member_id,'status':{'$in':['SUCCESSFUL','PENDING_ADMIN_VERIFICATION']}}) is not None
+
+@app.delete('/api/admin/members/<member_id>')
+@admin_required
+def admin_member_delete(member_id):
+    m=db.members.find_one({'id':member_id})
+    if not m: return json_error('Member not found.',404,'MEMBER_NOT_FOUND')
+    status=str(m.get('status','')).upper()
+    if status not in ADMIN_RECREATE_STATUSES: return json_error('Only failed, incomplete or rejected membership applications can be deleted. Approved/active memberships must be retained for audit history.',409,'MEMBER_PROTECTED')
+    if _admin_member_has_protected_payment(member_id): return json_error('This application has a successful or pending-admin-verification payment and cannot be deleted.',409,'PAYMENT_PROTECTED')
+    for coll in ['membership_otps','payments','membership_renewals','documents','notifications']:
+        try: db[coll].delete_many({'memberId':member_id})
+        except Exception: pass
+    db.members.delete_one({'_id':m['_id']})
+    audit('MEMBER_ADMIN_DELETED','member',member_id,{'status':status,'reason':'admin_recreate_failed_application'})
+    return jsonify(ok=True,message='Failed membership application removed. The member can now register again with the same email.')
+
+@app.post('/api/admin/members/<member_id>/recreate')
+@admin_required
+def admin_member_recreate(member_id):
+    m=db.members.find_one({'id':member_id})
+    if not m: return json_error('Member not found.',404,'MEMBER_NOT_FOUND')
+    status=str(m.get('status','')).upper()
+    if status not in ADMIN_RECREATE_STATUSES: return json_error('Only failed/incomplete applications can be recreated. Approved memberships are protected.',409,'MEMBER_PROTECTED')
+    if _admin_member_has_protected_payment(member_id): return json_error('This application has a successful or pending-admin-verification payment and cannot be recreated.',409,'PAYMENT_PROTECTED')
+    for coll in ['membership_otps','payments','membership_renewals','documents','notifications']:
+        try: db[coll].delete_many({'memberId':member_id})
+        except Exception: pass
+    token=secrets.token_urlsafe(32)
+    u={'status':'EMAIL_PENDING','emailVerified':False,'resumeToken':token,'recreateToken':secrets.token_urlsafe(32),'paymentId':None,'membershipPlanId':None,'membershipPlan':None,'membershipNumber':None,'validFrom':None,'validUntil':None,'certificateNumber':None,'adminMessage':'Your GLDC membership application has been reset. Please verify your email and continue the registration.','updatedAt':now()}
+    db.members.update_one({'_id':m['_id']},{'$set':u})
+    audit('MEMBER_APPLICATION_RECREATED','member',member_id,{'previousStatus':status})
+    return jsonify(ok=True,message='Membership application reset. The member can start again from email verification.',member=clean_doc({**m,**u}))
+
 @app.route('/member/login')
 def member_login_page():
     if _member_session(): return redirect('/member/dashboard')
@@ -1784,6 +1821,11 @@ def membership_change_plan():
     try:
         db.payments.insert_one(pay)
         db.membership_renewals.insert_one({'id':renewal_id,'memberId':m['id'],'paymentId':pid,'planId':plan['id'],'planName':plan['name'],'status':'PENDING_PAYMENT','type':'UPGRADE','createdAt':now(),'updatedAt':now()})
+        if amount <= 0:
+            db.payments.update_one({'id':pid},{'$set':{'status':'SUCCESSFUL','verifiedAt':now(),'verificationNote':'FREE_TIER: No payment required.'}})
+            db.membership_renewals.update_one({'id':renewal_id},{'$set':{'status':'PENDING_REVIEW','updatedAt':now()}})
+            db.members.update_one({'_id':m['_id']},{'$set':{'status':'PENDING_REVIEW','membershipPlan':plan['name'],'membershipPlanId':plan['id'],'paymentId':pid,'updatedAt':now()}})
+            return jsonify(ok=True,paymentId=pid,renewalId=renewal_id,receiptCode=receipt,status='SUCCESSFUL',free=True,message='This is a free membership tier. No M-Pesa payment is required; your application is now awaiting GLDC review.')
         r=daraja_stk(m['phone'],int(amount),m.get('membershipNumber') or m['id'],f"GLDC {plan['name']} membership upgrade")
         db.payments.update_one({'id':pid},{'$set':{'merchantRequestId':r.get('MerchantRequestID'),'checkoutRequestId':r.get('CheckoutRequestID'),'responseDescription':r.get('ResponseDescription')}})
         db.membership_renewals.update_one({'id':renewal_id},{'$set':{'status':'PAYMENT_PENDING','updatedAt':now()}})
@@ -1811,6 +1853,11 @@ def membership_subscribe():
     db.payments.insert_one(pay)
     if renewal_id: db.membership_renewals.insert_one({'id':renewal_id,'memberId':m['id'],'paymentId':pid,'planId':plan['id'],'planName':plan['name'],'status':'PENDING_PAYMENT','createdAt':now(),'updatedAt':now()})
     try:
+        if amount <= 0:
+            db.payments.update_one({'id':pid},{'$set':{'status':'SUCCESSFUL','verifiedAt':now(),'verificationNote':'FREE_TIER: No payment required.'}})
+            db.members.update_one({'_id':m['_id']},{'$set':{'status':'PENDING_REVIEW','membershipPlan':plan['name'],'membershipPlanId':plan['id'],'paymentId':pid,'updatedAt':now()}})
+            if renewal_id: db.membership_renewals.update_one({'id':renewal_id},{'$set':{'status':'PENDING_REVIEW','updatedAt':now()}})
+            return jsonify(ok=True,paymentId=pid,renewalId=renewal_id,receiptCode=receipt,status='SUCCESSFUL',purpose=purpose,free=True,message='This is a free membership tier. No M-Pesa payment is required; your application is now awaiting GLDC review.')
         r=daraja_stk(m['phone'],int(amount),m['membershipNumber'],f"GLDC {plan['name']} membership {purpose.lower()}")
         db.payments.update_one({'id':pid},{'$set':{'merchantRequestId':r.get('MerchantRequestID'),'checkoutRequestId':r.get('CheckoutRequestID'),'responseDescription':r.get('ResponseDescription')}})
         db.members.update_one({'_id':m['_id']},{'$set':{'status':'RENEWAL_PENDING' if is_renewal else 'PAYMENT_PENDING','membershipPlan':plan['name'],'membershipPlanId':plan['id'],'updatedAt':now()}})
@@ -1942,15 +1989,63 @@ def admin_membership_plans(): return jsonify(ok=True,plans=list_collection('memb
 @app.post('/api/admin/membership/plans')
 @admin_required
 def admin_membership_plan_create():
-    b=request.get_json(silent=True) or {}; name=str(b.get('name','')).strip(); price=float(b.get('price',0) or 0); months=int(b.get('months',1) or 1)
-    if not name or price<=0 or months<=0: return json_error('Plan name, price and duration are required.',422,'VALIDATION_ERROR')
-    doc={'id':make_id('PLAN'),'slug':_slugify(name),'name':name,'price':price,'currency':'KES','months':months,'billingCycle':'YEARLY' if months>=12 else 'MONTHLY','status':str(b.get('status','ACTIVE')).upper(),'description':str(b.get('description','')).strip(),'sortOrder':int(b.get('sortOrder',0) or 0),'createdAt':now(),'updatedAt':now()}
-    db.membership_plans.insert_one(doc); audit('MEMBERSHIP_PLAN_CREATED','membership_plan',doc['id']); return jsonify(ok=True,plan=clean_doc(doc)),201
+    b=request.get_json(silent=True) or {}; name=str(b.get('name','')).strip()
+    try: price=float(b.get('price',0) or 0); months=int(b.get('months',1) or 1)
+    except (TypeError,ValueError): return json_error('Price and duration must be valid numbers.',422,'VALIDATION_ERROR')
+    if not name or price<0 or months<=0: return json_error('Plan name and duration are required. Price may be KES 0 for a free tier.',422,'VALIDATION_ERROR')
+    slug=_slugify(name)
+    if db.membership_plans.find_one({'slug':slug}): return json_error('A membership tier with this name already exists.',409,'PLAN_EXISTS')
+    cycle=str(b.get('billingCycle') or ('YEARLY' if months>=12 else 'MONTHLY')).upper()
+    if cycle not in {'MONTHLY','YEARLY','CUSTOM'}: cycle='CUSTOM'
+    doc={'id':make_id('PLAN'),'slug':slug,'name':name,'price':price,'currency':'KES','months':months,'billingCycle':cycle,'status':str(b.get('status','ACTIVE')).upper(),'description':str(b.get('description','')).strip(),'sortOrder':int(b.get('sortOrder',0) or 0),'createdAt':now(),'updatedAt':now()}
+    db.membership_plans.insert_one(doc); audit('MEMBERSHIP_PLAN_CREATED','membership_plan',doc['id'],{'price':price,'months':months}); return jsonify(ok=True,plan=clean_doc(doc)),201
 
 @app.patch('/api/admin/membership/plans/<plan_id>')
 @admin_required
 def admin_membership_plan_update(plan_id):
-    b=request.get_json(silent=True) or {}; allowed=['name','price','months','billingCycle','status','description','sortOrder']; u={k:b[k] for k in allowed if k in b}; u['updatedAt']=now(); db.membership_plans.update_one({'id':plan_id},{'$set':u}); audit('MEMBERSHIP_PLAN_UPDATED','membership_plan',plan_id,u); return jsonify(ok=True)
+    plan=db.membership_plans.find_one({'id':plan_id})
+    if not plan: return json_error('Membership tier not found.',404,'PLAN_NOT_FOUND')
+    b=request.get_json(silent=True) or {}; u={}
+    if 'name' in b:
+        name=str(b['name']).strip()
+        if not name: return json_error('Tier name is required.',422,'VALIDATION_ERROR')
+        u['name']=name; u['slug']=_slugify(name)
+    if 'price' in b:
+        try: u['price']=float(b['price'])
+        except (TypeError,ValueError): return json_error('Price must be a number.',422,'VALIDATION_ERROR')
+        if u['price']<0: return json_error('Price cannot be negative.',422,'VALIDATION_ERROR')
+    if 'months' in b:
+        try: u['months']=int(b['months'])
+        except (TypeError,ValueError): return json_error('Duration must be a whole number of months.',422,'VALIDATION_ERROR')
+        if u['months']<=0: return json_error('Duration must be at least 1 month.',422,'VALIDATION_ERROR')
+    for k in ['billingCycle','status','description','sortOrder']:
+        if k in b: u[k]=b[k]
+    u['updatedAt']=now(); db.membership_plans.update_one({'id':plan_id},{'$set':u}); audit('MEMBERSHIP_PLAN_UPDATED','membership_plan',plan_id,{k:v for k,v in u.items() if k!='updatedAt'}); return jsonify(ok=True,plan=clean_doc({**plan,**u}))
+
+@app.delete('/api/admin/membership/plans/<plan_id>')
+@admin_required
+def admin_membership_plan_delete(plan_id):
+    plan=db.membership_plans.find_one({'id':plan_id})
+    if not plan: return json_error('Membership tier not found.',404,'PLAN_NOT_FOUND')
+    used=db.members.count_documents({'membershipPlanId':plan_id})
+    if used: return json_error(f'This tier is already linked to {used} member record(s). Set it INACTIVE instead of deleting it.',409,'PLAN_IN_USE')
+    db.membership_plans.delete_one({'_id':plan['_id']}); audit('MEMBERSHIP_PLAN_DELETED','membership_plan',plan_id); return jsonify(ok=True)
+
+@app.get('/api/admin/membership/dashboard')
+@admin_required
+def admin_membership_dashboard():
+    plans=list(db.membership_plans.find({}).sort('sortOrder',ASCENDING))
+    members=[sync_membership_state(x) for x in db.members.find({})]
+    payments=list(db.payments.find({'purpose':{'$regex':'^MEMBERSHIP'}}).sort('createdAt',DESCENDING).limit(1000))
+    successful=[p for p in payments if str(p.get('status','')).upper()=='SUCCESSFUL']
+    pending=[p for p in payments if str(p.get('status','')).upper() in {'PENDING','PENDING_ADMIN_VERIFICATION','PAYMENT_PENDING'}]
+    failed=[p for p in payments if str(p.get('status','')).upper() in {'FAILED','CANCELLED'}]
+    revenue=sum(float(p.get('amount',0) or 0) for p in successful)
+    tier_stats=[]
+    for pl in plans:
+        mids={m.get('id') for m in members if m.get('membershipPlanId')==pl.get('id') or m.get('membershipPlan')==pl.get('name')}
+        tier_stats.append({'id':pl.get('id'),'name':pl.get('name'),'price':float(pl.get('price',0) or 0),'months':int(pl.get('months',1) or 1),'billingCycle':pl.get('billingCycle'),'status':pl.get('status'),'members':len(mids),'active':sum(1 for m in members if m.get('id') in mids and m.get('status') in {'ACTIVE','EXPIRING_SOON'}),'pending':sum(1 for m in members if m.get('id') in mids and m.get('status') in {'PENDING_REVIEW','PENDING_PAYMENT','PAYMENT_PENDING','PAYMENT_FAILED','CHANGES_REQUIRED'}),'revenue':sum(float(p.get('amount',0) or 0) for p in successful if p.get('planId')==pl.get('id'))})
+    return jsonify(ok=True,summary={'tiers':len(plans),'members':len(members),'active':sum(1 for m in members if m.get('status') in {'ACTIVE','EXPIRING_SOON'}),'pending':sum(1 for m in members if m.get('status') in {'PENDING_REVIEW','PENDING_PAYMENT','PAYMENT_PENDING','PAYMENT_FAILED','CHANGES_REQUIRED'}),'successfulPayments':len(successful),'pendingPayments':len(pending),'failedPayments':len(failed),'revenue':revenue},tiers=tier_stats)
 
 @app.get('/api/admin/members')
 @admin_required
